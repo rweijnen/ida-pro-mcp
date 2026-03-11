@@ -431,11 +431,41 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
     return response
 
 
+# Must exceed the longest tool timeout (decompile=90s) to avoid
+# the MCP server giving up before IDA finishes processing.
+_IDA_HTTP_TIMEOUT = 120
+
+# Persistent connections per (host, port) — avoids TCP handshake per request.
+_connection_pool: dict[tuple[str, int], http.client.HTTPConnection] = {}
+
+
+def _get_connection(host: str, port: int) -> http.client.HTTPConnection:
+    """Get or create a persistent HTTP connection to an IDA instance."""
+    key = (host, port)
+    conn = _connection_pool.get(key)
+    if conn is not None:
+        return conn
+    conn = http.client.HTTPConnection(host, port, timeout=_IDA_HTTP_TIMEOUT)
+    _connection_pool[key] = conn
+    return conn
+
+
+def _evict_connection(host: str, port: int) -> None:
+    """Remove a failed connection from the pool."""
+    key = (host, port)
+    conn = _connection_pool.pop(key, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _forward_to_ida(
     host: str, port: int, request_obj: dict, raw_request: dict | str | bytes | bytearray
 ) -> JsonRpcResponse | None:
     """Forward a JSON-RPC request to an IDA instance."""
-    conn = http.client.HTTPConnection(host, port, timeout=30)
+    conn = _get_connection(host, port)
     try:
         if isinstance(raw_request, dict):
             body = json.dumps(raw_request)
@@ -448,6 +478,8 @@ def _forward_to_ida(
         data = response.read().decode()
         return json.loads(data)
     except Exception as e:
+        # Connection failed — evict from pool so next call reconnects
+        _evict_connection(host, port)
         full_info = traceback.format_exc()
         id = request_obj.get("id")
         if id is None:
@@ -463,8 +495,6 @@ def _forward_to_ida(
                 "id": id,
             }
         )
-    finally:
-        conn.close()
 
 
 def _dispatch_tools_list(request_obj: dict, raw_request) -> JsonRpcResponse | None:
