@@ -4,6 +4,8 @@ This file serves as the entry point for IDA Pro's plugin system.
 It loads the actual implementation from the ida_mcp package.
 """
 
+import json
+import os
 import sys
 import idaapi
 import ida_kernwin
@@ -26,6 +28,26 @@ def unload_package(package_name: str):
 
 CONFIG_ACTION_ID = "mcp:configure"
 CONFIG_ACTION_LABEL = "MCP Configuration"
+
+# Shared config directory for communicating IDA path to the MCP server
+_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".ida_mcp")
+_CONFIG_FILE = os.path.join(_CONFIG_DIR, "config.json")
+
+
+def _write_ida_config():
+    """Write IDA installation path to shared config. Called on every plugin init."""
+    ida_dir = idaapi.idadir("")
+    os.makedirs(_CONFIG_DIR, exist_ok=True)
+    config = {}
+    if os.path.exists(_CONFIG_FILE):
+        try:
+            with open(_CONFIG_FILE, "r") as f:
+                config = json.load(f)
+        except Exception:
+            pass
+    config["ida_dir"] = ida_dir
+    with open(_CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
 
 
 class MCPConfigForm(idaapi.Form):
@@ -88,7 +110,7 @@ class MCPUIHooks(ida_kernwin.UI_Hooks):
 
 
 class MCP(idaapi.plugin_t):
-    flags = idaapi.PLUGIN_KEEP
+    flags = idaapi.PLUGIN_FIX
     comment = "MCP Plugin"
     help = "MCP"
     wanted_name = "MCP"
@@ -98,16 +120,15 @@ class MCP(idaapi.plugin_t):
     DEFAULT_PORT = 13337
 
     def init(self):
-        hotkey = MCP.wanted_hotkey.replace("-", "+")
-        if __import__("sys").platform == "darwin":
-            hotkey = hotkey.replace("Alt", "Option")
-
-        print(
-            f"[MCP] Plugin loaded, use Edit -> Plugins -> MCP ({hotkey}) to start the server"
-        )
         self.mcp: "ida_mcp.rpc.McpServer | None" = None
         self.host = self.DEFAULT_HOST
         self.port = self.DEFAULT_PORT
+
+        # Write IDA installation path so load_binary can find ida.exe
+        try:
+            _write_ida_config()
+        except Exception as e:
+            print(f"[MCP] Warning: could not write config: {e}")
 
         # Register a separate menu item for host/port configuration
         ida_kernwin.register_action(
@@ -121,24 +142,31 @@ class MCP(idaapi.plugin_t):
         self._ui_hooks = MCPUIHooks()
         self._ui_hooks.hook()
 
-        return idaapi.PLUGIN_KEEP
+        # Auto-start the HTTP server after one event-loop tick.
+        # Direct start during init() can deadlock because importing
+        # ida_mcp triggers @idasync / execute_sync calls.
+        # Caches (strings, functions, globals) are lazy -- built on first
+        # request rather than eagerly, so they reflect post-analysis state.
+        idaapi.register_timer(100, self._delayed_auto_start)
 
-    def run(self, arg):
-        if self.mcp:
-            self.mcp.stop()
-            self.mcp = None
+        print("[MCP] Plugin loaded (auto-start enabled)")
+        return idaapi.PLUGIN_FIX
 
-        # HACK: ensure fresh load of ida_mcp package
+    def _delayed_auto_start(self):
+        """Timer callback: start the HTTP server once after init."""
+        try:
+            self._start_server()
+        except Exception as e:
+            print(f"[MCP] Auto-start failed: {e}")
+        return -1  # negative = don't repeat the timer
+
+    def _start_server(self):
+        """Start the HTTP server, scanning for an available port."""
         unload_package("ida_mcp")
         if TYPE_CHECKING:
-            from .ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, init_caches
+            from .ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler
         else:
-            from ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, init_caches
-
-        try:
-            init_caches()
-        except Exception as e:
-            print(f"[MCP] Cache init failed: {e}")
+            from ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler
 
         port = self.port
         max_port = port + 100
@@ -147,6 +175,7 @@ class MCP(idaapi.plugin_t):
                 MCP_SERVER.serve(
                     self.host, port, request_handler=IdaMcpHttpRequestHandler
                 )
+                print(f"[MCP] Server started on http://{self.host}:{port}")
                 print(f"  Config: http://{self.host}:{port}/config.html")
                 self.mcp = MCP_SERVER
                 return
@@ -156,6 +185,16 @@ class MCP(idaapi.plugin_t):
                 else:
                     raise
         print(f"[MCP] Error: No available port in range {self.port}-{max_port - 1}")
+
+    def run(self, arg):
+        """Hotkey handler: toggle server on/off."""
+        if self.mcp:
+            self.mcp.stop()
+            self.mcp = None
+            print("[MCP] Server stopped")
+            return
+
+        self._start_server()
 
     def term(self):
         if hasattr(self, "_ui_hooks"):
@@ -167,7 +206,3 @@ class MCP(idaapi.plugin_t):
 
 def PLUGIN_ENTRY():
     return MCP()
-
-
-# IDA plugin flags
-PLUGIN_FLAGS = idaapi.PLUGIN_HIDE | idaapi.PLUGIN_FIX

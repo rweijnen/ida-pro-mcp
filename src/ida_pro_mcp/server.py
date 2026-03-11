@@ -4,6 +4,7 @@ import json
 import shutil
 import argparse
 import http.client
+import subprocess
 import tempfile
 import traceback
 import tomllib
@@ -72,7 +73,7 @@ class IDAInstance:
         return d
 
 
-def _probe_instance(host: str, port: int, timeout: float = 0.5) -> IDAInstance | None:
+def _probe_instance(host: str, port: int, timeout: float = 2.0) -> IDAInstance | None:
     """Try to connect to an IDA MCP plugin and fetch its metadata."""
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
@@ -225,6 +226,103 @@ def get_active_instance() -> dict:
 
 
 # ============================================================================
+# load_binary - spawn a new IDA instance
+# ============================================================================
+
+_IDA_MCP_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".ida_mcp")
+_IDA_MCP_CONFIG_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "config.json")
+_IDA_TOOLS_CACHE_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "tools_cache.json")
+
+
+def _read_ida_config() -> dict:
+    """Read shared config written by the IDA plugin."""
+    try:
+        with open(_IDA_MCP_CONFIG_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_tools_cache(tools: list) -> None:
+    """Save IDA tool definitions to disk for offline use."""
+    try:
+        os.makedirs(_IDA_MCP_CONFIG_DIR, exist_ok=True)
+        with open(_IDA_TOOLS_CACHE_FILE, "w") as f:
+            json.dump(tools, f)
+    except Exception:
+        pass
+
+
+def _load_tools_cache() -> list:
+    """Load cached IDA tool definitions from disk."""
+    try:
+        with open(_IDA_TOOLS_CACHE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+@mcp.tool
+def load_binary(binary_path: str) -> dict:
+    """Open a binary in a new IDA Pro instance. The MCP plugin auto-starts.
+
+    Spawns IDA Pro with the given binary and returns immediately.
+    The instance will appear in list_instances once IDA finishes loading
+    and the MCP plugin starts (typically 10-60s, longer for large binaries).
+    Poll list_instances in a background task to detect when it's ready.
+
+    Args:
+        binary_path: Absolute path to the binary file to analyze.
+    """
+    # Validate path
+    if not os.path.isabs(binary_path):
+        return {"error": f"binary_path must be absolute, got: {binary_path}"}
+    if not os.path.isfile(binary_path):
+        return {"error": f"File not found: {binary_path}"}
+
+    # Read IDA installation path from shared config
+    config = _read_ida_config()
+    ida_dir = config.get("ida_dir")
+    if not ida_dir:
+        return {
+            "error": (
+                "IDA installation path not found. "
+                "Start IDA once with the MCP plugin so it can write the config to "
+                f"{_IDA_MCP_CONFIG_FILE}"
+            )
+        }
+
+    # Find IDA executable (IDA 9.3+ has single "ida" binary, older versions have "ida64")
+    if sys.platform == "win32":
+        ida_exe = os.path.join(ida_dir, "ida.exe")
+        if not os.path.isfile(ida_exe):
+            ida_exe = os.path.join(ida_dir, "ida64.exe")
+    else:
+        ida_exe = os.path.join(ida_dir, "ida")
+        if not os.path.isfile(ida_exe):
+            ida_exe = os.path.join(ida_dir, "ida64")
+
+    if not os.path.isfile(ida_exe):
+        return {"error": f"IDA executable not found at {ida_dir}. Is IDA still installed there?"}
+
+    # Record existing ports before spawning
+    pre_spawn = [inst.port for inst in instance_manager.discover()]
+
+    # Spawn IDA
+    try:
+        proc = subprocess.Popen([ida_exe, binary_path])
+    except Exception as e:
+        return {"error": f"Failed to launch IDA: {e}"}
+
+    return {
+        "status": "spawned",
+        "pid": proc.pid,
+        "binary_path": binary_path,
+        "pre_existing_ports": pre_spawn,
+    }
+
+
+# ============================================================================
 # Dispatch proxy - routes to active IDA instance
 # ============================================================================
 
@@ -244,14 +342,18 @@ EFFECTIVE USE OF IDA:
 - Only fall back to raw memory reads or external tools for truly low-level tasks that IDA's analysis cannot cover.
 - list_instances reports analysis_complete for each instance. If analysis is still running, results may be incomplete -- wait or re-check later.
 
-WHEN TO ASK THE USER TO LOAD A BINARY:
-- If you need to analyze a binary that is not currently open in any IDA instance, ask the user to open it in IDA and start the MCP plugin (Ctrl+Alt+M). Then use list_instances to discover it.
+LOADING BINARIES:
+- Use load_binary to open a binary in a new IDA Pro instance. The MCP plugin auto-starts, so no manual activation is needed.
+- load_binary returns immediately after spawning IDA. It includes pre_existing_ports so you can detect the new instance. Poll list_instances in a background task until a new port appears (not in pre_existing_ports), then switch_instance to it. This typically takes 10-60s but can be longer for large binaries.
+- IMPORTANT: Call list_instances once before using load_binary. This establishes MCP tool permissions so background polling agents can call list_instances without being blocked by permission prompts.
+- After the instance appears, IDA's auto-analysis may still be running. Check analysis_complete in list_instances before relying on complete results.
+- If load_binary is unavailable (e.g. no config yet), ask the user to open IDA once so the plugin can write its config, then retry.
 - Do not try to reverse-engineer binaries manually with capstone, struct.unpack, or byte-level parsing when IDA can do it better. Opening the binary in IDA and using MCP tools gives far superior results (full disassembly, decompilation, type recovery, xrefs, string analysis) with less effort.
 - For non-trivial analysis tasks, IDA + MCP is almost always the fastest path to high-quality results. Only use manual approaches for quick one-off checks on small data.
 """
 
 # Tools handled locally by the MCP server (not forwarded to IDA plugin)
-_LOCAL_TOOLS = {"list_instances", "switch_instance", "get_active_instance"}
+_LOCAL_TOOLS = {"list_instances", "switch_instance", "get_active_instance", "load_binary"}
 
 
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
@@ -303,8 +405,9 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
                     "code": -32000,
                     "message": (
                         "No IDA Pro instances found! "
-                        f"Open IDA and run Edit -> Plugins -> MCP ({shortcut}) to start the server, "
-                        "then call list_instances to discover it."
+                        "Use load_binary to open a binary in IDA, or "
+                        f"open IDA manually and the MCP plugin will auto-start. "
+                        "Then call list_instances to discover it."
                     ),
                 },
                 "id": id,
@@ -378,12 +481,22 @@ def _dispatch_tools_list(request_obj: dict, raw_request) -> JsonRpcResponse | No
         ida_response = _forward_to_ida(active.host, active.port, request_obj, raw_request)
         if ida_response and "result" in ida_response:
             ida_tools = ida_response["result"].get("tools", [])
+            _save_tools_cache(ida_tools)
             # Merge: IDA tools + local tools
             merged = ida_tools + local_tools
             ida_response["result"]["tools"] = merged
             return ida_response
 
-    # No IDA instance - return just local tools
+    # No IDA instance - use cached tool definitions so Claude knows what's available
+    cached_tools = _load_tools_cache()
+    if cached_tools:
+        all_tools = cached_tools + local_tools
+        return JsonRpcResponse({
+            "jsonrpc": "2.0",
+            "result": {"tools": all_tools},
+            "id": request_obj.get("id"),
+        })
+
     return local_response
 
 

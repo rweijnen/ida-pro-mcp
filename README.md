@@ -1,4 +1,10 @@
-# IDA Pro MCP
+# IDA Pro MCP (Fork)
+
+Fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) with additional features:
+
+- **Auto-start plugin** — MCP server starts automatically when IDA opens (no Ctrl+Alt+M needed)
+- **`load_binary` tool** — AI clients can spawn new IDA instances directly
+- **Multi-instance improvements** — more reliable discovery with increased probe timeout
 
 Simple [MCP Server](https://modelcontextprotocol.io/introduction) to allow vibe reversing in IDA Pro.
 
@@ -39,12 +45,14 @@ The binaries and prompt for the video are available in the [mcp-reversing-datase
 
 ## Installation
 
-Install the latest version of the IDA Pro MCP package:
+Install this fork of the IDA Pro MCP package:
 
 ```sh
 pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
+pip install https://github.com/rweijnen/ida-pro-mcp/archive/refs/heads/main.zip
 ```
+
+To install the upstream version instead, use `https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip`.
 
 Configure the MCP servers and install the IDA Plugin:
 
@@ -56,7 +64,7 @@ ida-pro-mcp --install
 
 https://github.com/user-attachments/assets/65ed3373-a187-4dd5-a807-425dca1d8ee9
 
-_Note_: You need to load a binary in IDA before the plugin menu will show up.
+The MCP plugin **auto-starts** when IDA opens — no manual activation needed. The HTTP server starts immediately, and caches are initialized automatically when a binary is loaded. You can still use Ctrl+Alt+M to toggle the server on/off if needed.
 
 ## Prompt Engineering
 
@@ -141,15 +149,22 @@ The MCP server supports multiple IDA instances running simultaneously. Each IDA 
 | `list_instances` | Discover and list all running IDA instances (binary name, port, processor, analysis status) |
 | `switch_instance` | Switch active instance by port number or binary name substring |
 | `get_active_instance` | Get info about the currently active instance |
+| `load_binary` | Spawn a new IDA Pro instance with a binary (returns immediately, non-blocking) |
 
 **Workflow:**
 
-1. Open multiple binaries in separate IDA instances
-2. Start the MCP plugin in each (Edit -> Plugins -> MCP, or Ctrl+Alt+M)
-3. Use `list_instances` to discover all instances
-4. Use `switch_instance(name="firmware")` or `switch_instance(port=13338)` to change which instance receives tool calls
+1. Open multiple binaries in separate IDA instances — the MCP plugin auto-starts in each
+2. Or use `load_binary("/path/to/binary")` from the AI client to spawn a new IDA instance
+3. Poll `list_instances` until the new instance appears (check for ports not in `pre_existing_ports` from the `load_binary` response)
+4. Use `switch_instance(name="firmware")` or `switch_instance(port=13338)` to activate it
 
-When multiple instances are active, tool responses are tagged with `[instance: <binary> @ port <N>]` so the AI can verify it is querying the correct binary. The MCP server also injects instructions into the initialize response to guide AI clients on multi-instance workflow, effective use of IDA tools, and when to ask the user to load additional binaries.
+**`load_binary` details:**
+
+The `load_binary` tool spawns IDA and returns immediately with the PID and a list of pre-existing ports. It reads the IDA installation path from `~/.ida_mcp/config.json` (written automatically by the plugin on first load). The AI client should poll `list_instances` in a background task until a new port appears, then `switch_instance` to it. This typically takes 10-60s but can be longer for large binaries with extensive auto-analysis.
+
+**Tip for Claude Code users:** Call `list_instances` once in the foreground before using `load_binary`. This establishes the MCP tool permission so that background polling agents can call `list_instances` without being blocked by permission prompts.
+
+When multiple instances are active, tool responses are tagged with `[instance: <binary> @ port <N>]` so the AI can verify it is querying the correct binary. The MCP server also injects instructions into the initialize response to guide AI clients on multi-instance workflow and effective use of IDA tools.
 
 **Windows port safety:** On Windows, `SO_EXCLUSIVEADDRUSE` prevents multiple IDA instances from silently sharing the same port (a common `SO_REUSEADDR` pitfall on Windows).
 

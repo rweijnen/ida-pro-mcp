@@ -24,6 +24,13 @@ from ida_pro_mcp.server import (
     IDAInstance,
     InstanceManager,
     _probe_instance,
+    _read_ida_config,
+    _save_tools_cache,
+    _load_tools_cache,
+    load_binary,
+    instance_manager,
+    _IDA_MCP_CONFIG_FILE,
+    _IDA_TOOLS_CACHE_FILE,
 )
 
 
@@ -286,6 +293,162 @@ class TestDispatchTagging:
             assert "result" in response
         finally:
             server.shutdown()
+
+
+class TestReadIdaConfig:
+    def test_missing_config(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "ida_pro_mcp.server._IDA_MCP_CONFIG_FILE",
+            str(tmp_path / "nonexistent.json"),
+        )
+        assert _read_ida_config() == {}
+
+    def test_valid_config(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"ida_dir": "C:\\IDA"}))
+        monkeypatch.setattr("ida_pro_mcp.server._IDA_MCP_CONFIG_FILE", str(cfg))
+        assert _read_ida_config() == {"ida_dir": "C:\\IDA"}
+
+    def test_corrupt_config(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.json"
+        cfg.write_text("not json")
+        monkeypatch.setattr("ida_pro_mcp.server._IDA_MCP_CONFIG_FILE", str(cfg))
+        assert _read_ida_config() == {}
+
+
+class TestToolsCache:
+    def test_save_and_load(self, tmp_path, monkeypatch):
+        cache_file = str(tmp_path / "tools_cache.json")
+        monkeypatch.setattr("ida_pro_mcp.server._IDA_TOOLS_CACHE_FILE", cache_file)
+        monkeypatch.setattr("ida_pro_mcp.server._IDA_MCP_CONFIG_DIR", str(tmp_path))
+        tools = [{"name": "list_funcs", "description": "List functions"}]
+        _save_tools_cache(tools)
+        loaded = _load_tools_cache()
+        assert loaded == tools
+
+    def test_load_missing_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "ida_pro_mcp.server._IDA_TOOLS_CACHE_FILE",
+            str(tmp_path / "nonexistent.json"),
+        )
+        assert _load_tools_cache() == []
+
+    def test_load_corrupt_file(self, tmp_path, monkeypatch):
+        cache_file = tmp_path / "tools_cache.json"
+        cache_file.write_text("not json")
+        monkeypatch.setattr("ida_pro_mcp.server._IDA_TOOLS_CACHE_FILE", str(cache_file))
+        assert _load_tools_cache() == []
+
+
+class TestLoadBinary:
+    def test_relative_path_rejected(self):
+        result = load_binary("relative/path.exe")
+        assert "error" in result
+        assert "absolute" in result["error"]
+
+    def test_missing_file_rejected(self, tmp_path):
+        result = load_binary(str(tmp_path / "nonexistent.exe"))
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
+    def test_no_config(self, tmp_path, monkeypatch):
+        binary = tmp_path / "test.exe"
+        binary.write_bytes(b"\x00")
+        monkeypatch.setattr(
+            "ida_pro_mcp.server._IDA_MCP_CONFIG_FILE",
+            str(tmp_path / "nope.json"),
+        )
+        result = load_binary(str(binary))
+        assert "error" in result
+        assert "config" in result["error"].lower()
+
+    def test_ida_exe_not_found(self, tmp_path, monkeypatch):
+        binary = tmp_path / "test.exe"
+        binary.write_bytes(b"\x00")
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"ida_dir": str(tmp_path / "fake_ida")}))
+        monkeypatch.setattr("ida_pro_mcp.server._IDA_MCP_CONFIG_FILE", str(cfg))
+        result = load_binary(str(binary))
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
+    def test_successful_spawn(self, tmp_path, monkeypatch):
+        """Test that load_binary spawns IDA and returns immediately."""
+        binary = tmp_path / "test.exe"
+        binary.write_bytes(b"\x00")
+
+        # Create a fake IDA executable
+        ida_dir = tmp_path / "ida"
+        ida_dir.mkdir()
+        if sys.platform == "win32":
+            ida_exe = ida_dir / "ida.exe"
+        else:
+            ida_exe = ida_dir / "ida"
+        ida_exe.write_bytes(b"\x00")
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"ida_dir": str(ida_dir)}))
+        monkeypatch.setattr("ida_pro_mcp.server._IDA_MCP_CONFIG_FILE", str(cfg))
+
+        # Use an empty port range so discover returns nothing
+        saved_mgr = instance_manager.__dict__.copy()
+        instance_manager.base_port = 18800
+        instance_manager.port_range = 3
+        instance_manager.instances = {}
+        instance_manager.active_port = None
+
+        class FakeProc:
+            pid = 12345
+        monkeypatch.setattr("ida_pro_mcp.server.subprocess.Popen", lambda *a, **kw: FakeProc())
+
+        try:
+            result = load_binary(str(binary))
+            assert "error" not in result, f"Unexpected error: {result.get('error')}"
+            assert result["status"] == "spawned"
+            assert result["pid"] == 12345
+            assert result["binary_path"] == str(binary)
+            assert isinstance(result["pre_existing_ports"], list)
+        finally:
+            instance_manager.__dict__.update(saved_mgr)
+
+    def test_spawn_records_pre_existing_ports(self, tmp_path, monkeypatch):
+        """Test that load_binary returns pre-existing ports for polling."""
+        binary = tmp_path / "test.exe"
+        binary.write_bytes(b"\x00")
+
+        ida_dir = tmp_path / "ida"
+        ida_dir.mkdir()
+        if sys.platform == "win32":
+            ida_exe = ida_dir / "ida.exe"
+        else:
+            ida_exe = ida_dir / "ida"
+        ida_exe.write_bytes(b"\x00")
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"ida_dir": str(ida_dir)}))
+        monkeypatch.setattr("ida_pro_mcp.server._IDA_MCP_CONFIG_FILE", str(cfg))
+
+        # Start a fake instance so it shows up as pre-existing
+        test_port = 18815
+        fake_server = start_fake_ida(test_port, {"module": "existing.bin"})
+
+        saved_mgr = instance_manager.__dict__.copy()
+        instance_manager.base_port = test_port
+        instance_manager.port_range = 3
+        instance_manager.instances = {}
+        instance_manager.active_port = None
+
+        class FakeProc:
+            pid = 99999
+        monkeypatch.setattr("ida_pro_mcp.server.subprocess.Popen", lambda *a, **kw: FakeProc())
+
+        try:
+            result = load_binary(str(binary))
+            assert result["status"] == "spawned"
+            assert test_port in result["pre_existing_ports"]
+        finally:
+            fake_server.shutdown()
+            instance_manager.__dict__.update(saved_mgr)
 
 
 if __name__ == "__main__":
