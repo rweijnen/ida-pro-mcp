@@ -166,8 +166,14 @@ def _resolve_immediate_insn_start(
 @tool_timeout(90.0)
 def decompile(
     addr: Annotated[str, "Function address or name to decompile"],
+    max_lines: Annotated[int, "Max lines to return (0 = unlimited, suggest 200 for large functions)"] = 0,
+    offset: Annotated[int, "Skip first N lines (default: 0)"] = 0,
+    include_total: Annotated[bool, "Include total_lines count (default: false)"] = False,
 ) -> dict:
     """Decompile function to pseudocode"""
+    if offset < 0:
+        offset = 0
+
     try:
         try:
             start = parse_address(addr)
@@ -178,14 +184,36 @@ def decompile(
                     "addr": addr,
                     "code": None,
                     "error": f"Function not found: {addr!r}",
+                    "cursor": {"done": True},
                 }
             start = ea
         code = decompile_function_safe(start)
         if code is None:
-            return {"addr": addr, "code": None, "error": "Decompilation failed"}
-        return {"addr": addr, "code": code}
+            return {"addr": addr, "code": None, "error": "Decompilation failed",
+                    "cursor": {"done": True}}
+
+        lines = code.splitlines(keepends=True)
+        total = len(lines)
+        result: dict = {"addr": addr}
+
+        if max_lines > 0:
+            page = lines[offset:offset + max_lines]
+            result["code"] = "".join(page)
+            end = offset + len(page)
+            result["line_count"] = len(page)
+            result["cursor"] = {"done": True} if end >= total else {"next": end}
+        else:
+            result["code"] = code
+            result["line_count"] = total
+            result["cursor"] = {"done": True}
+
+        if include_total:
+            result["total_lines"] = total
+
+        return result
     except Exception as e:
-        return {"addr": addr, "code": None, "error": str(e)}
+        return {"addr": addr, "code": None, "error": str(e),
+                "cursor": {"done": True}}
 
 
 @tool
@@ -382,10 +410,16 @@ def xrefs_to(
 
 @tool
 @idasync
-def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[dict]:
+def xrefs_to_field(
+    queries: list[StructFieldQuery] | StructFieldQuery,
+    limit: Annotated[int, "Max xrefs per field (default: 100, max: 1000)"] = 100,
+) -> list[dict]:
     """Get cross-references to structure fields"""
     if isinstance(queries, dict):
         queries = [queries]
+
+    if limit <= 0 or limit > 1000:
+        limit = 1000
 
     results = []
     til = ida_typeinf.get_idati()
@@ -444,16 +478,20 @@ def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[d
                 continue
 
             xrefs = []
+            more = False
             xref: ida_xref.xrefblk_t
             for xref in idautils.XrefsTo(tid):
-                xrefs += [
+                if len(xrefs) >= limit:
+                    more = True
+                    break
+                xrefs.append(
                     Xref(
                         addr=hex(xref.frm),
                         type="code" if xref.iscode else "data",
                         fn=get_function(xref.frm, raise_error=False),
                     )
-                ]
-            results.append({"struct": struct_name, "field": field_name, "xrefs": xrefs})
+                )
+            results.append({"struct": struct_name, "field": field_name, "xrefs": xrefs, "more": more})
         except Exception as e:
             results.append(
                 {

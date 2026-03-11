@@ -350,6 +350,10 @@ LOADING BINARIES:
 - If load_binary is unavailable (e.g. no config yet), ask the user to open IDA once so the plugin can write its config, then retry.
 - Do not try to reverse-engineer binaries manually with capstone, struct.unpack, or byte-level parsing when IDA can do it better. Opening the binary in IDA and using MCP tools gives far superior results (full disassembly, decompilation, type recovery, xrefs, string analysis) with less effort.
 - For non-trivial analysis tasks, IDA + MCP is almost always the fastest path to high-quality results. Only use manual approaches for quick one-off checks on small data.
+
+TOKEN EFFICIENCY:
+- decompile supports max_lines and offset for pagination. For unknown functions, start with max_lines=200 to preview, then request more if needed.
+- get_bytes returns hex inline for reads <= 4096 bytes. Larger reads (up to 1MB) are saved to a temp file -- use the file path with your Read tool to examine.
 """
 
 # Tools handled locally by the MCP server (not forwarded to IDA plugin)

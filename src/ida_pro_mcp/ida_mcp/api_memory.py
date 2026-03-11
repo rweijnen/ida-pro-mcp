@@ -4,7 +4,9 @@ This module provides batch operations for reading and writing memory at various
 granularities (bytes, integers, strings) and patching binary data.
 """
 
+import os
 import re
+import tempfile
 
 from typing import Annotated
 import ida_bytes
@@ -26,6 +28,9 @@ from .utils import (
 # Memory Reading Operations
 # ============================================================================
 
+MAX_BYTES_INLINE = 4096
+MAX_BYTES_TOTAL = 1024 * 1024  # 1 MB
+
 
 @tool
 @idasync
@@ -41,8 +46,18 @@ def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[dict]:
 
         try:
             ea = parse_address(addr)
-            data = " ".join(f"{x:#02x}" for x in ida_bytes.get_bytes(ea, size))
-            results.append({"addr": addr, "data": data})
+            if size > MAX_BYTES_TOTAL:
+                results.append({"addr": addr, "error": f"Size {size} exceeds 1MB max"})
+            elif size > MAX_BYTES_INLINE:
+                raw = ida_bytes.get_bytes(ea, size)
+                path = os.path.join(tempfile.gettempdir(), f"ida_mcp_{ea:#x}_{size}.bin")
+                with open(path, "wb") as f:
+                    f.write(raw)
+                results.append({"addr": addr, "file": path, "size": size,
+                                "hint": "Binary file saved. Use Read tool to examine."})
+            else:
+                data = " ".join(f"{x:#02x}" for x in ida_bytes.get_bytes(ea, size))
+                results.append({"addr": addr, "data": data})
         except Exception as e:
             results.append({"addr": addr, "data": None, "error": str(e)})
 
