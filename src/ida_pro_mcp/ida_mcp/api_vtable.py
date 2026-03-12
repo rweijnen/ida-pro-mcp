@@ -10,7 +10,7 @@ from typing import Annotated, Any
 import idc
 
 from .rpc import tool
-from .sync import IDAError, idasync
+from .sync import IDAError, idaread
 from .utils import normalize_list_input, paginate, parse_address, pattern_filter
 
 # Fields to keep in compact vtable_scan results
@@ -42,7 +42,7 @@ def _compact_vtable_entry(entry: dict) -> dict:
 
 
 @tool
-@idasync
+@idaread
 def vtable_scan(
     filter: Annotated[str, "Optional glob pattern to filter class names"] = "",
     count: Annotated[int, "Maximum results (0 = all)"] = 50,
@@ -60,7 +60,7 @@ def vtable_scan(
 
 
 @tool
-@idasync
+@idaread
 def vtable_entries(
     addrs: Annotated[list[str] | str, "VTable address(es)"],
 ) -> list[dict]:
@@ -86,7 +86,7 @@ def vtable_entries(
 
 
 @tool
-@idasync
+@idaread
 def vtable_compare(
     derived: Annotated[str, "Derived class vtable address"],
     base: Annotated[str, "Base class vtable address"],
@@ -102,7 +102,7 @@ def vtable_compare(
 
 
 @tool
-@idasync
+@idaread
 def vtable_hierarchy(
     class_name: Annotated[str, "Class name to query"],
 ) -> dict:
