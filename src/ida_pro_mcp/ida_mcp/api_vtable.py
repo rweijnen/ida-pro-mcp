@@ -13,6 +13,9 @@ from .rpc import tool
 from .sync import IDAError, idasync
 from .utils import normalize_list_input, paginate, parse_address, pattern_filter
 
+# Fields to keep in compact vtable_scan results
+_SCAN_COMPACT_KEYS = {"address", "class_name", "func_count", "is_abstract", "derived_count"}
+
 
 def _eval_vtable_idc(expr: str) -> Any:
     """Call a VTableExplorer IDC function and parse the JSON result.
@@ -26,6 +29,16 @@ def _eval_vtable_idc(expr: str) -> Any:
         return json.loads(result)
     except (json.JSONDecodeError, TypeError) as e:
         raise IDAError(f"VTableExplorer returned invalid JSON: {e}")
+
+
+def _compact_scan_entry(entry: dict) -> dict:
+    """Strip low-value fields from a vtable scan entry."""
+    return {k: v for k, v in entry.items() if k in _SCAN_COMPACT_KEYS}
+
+
+def _compact_vtable_entry(entry: dict) -> dict:
+    """Strip slot_addr from a vtable function entry."""
+    return {k: v for k, v in entry.items() if k != "slot_addr"}
 
 
 @tool
@@ -42,6 +55,7 @@ def vtable_scan(
     if not isinstance(data, list):
         raise IDAError("VTableExplorer_Scan() did not return a list")
     data = pattern_filter(data, filter, "class_name")
+    data = [_compact_scan_entry(e) for e in data]
     return paginate(data, offset, count)
 
 
@@ -59,7 +73,13 @@ def vtable_entries(
         try:
             ea = parse_address(addr_str)
             data = _eval_vtable_idc(f"VTableExplorer_Entries({ea:#x})")
-            results.append({"addr": f"{ea:#x}", "entries": data})
+            # Compact: strip slot_addr from entries, keep class_name for context
+            entries = [_compact_vtable_entry(e) for e in data.get("entries", [])]
+            results.append({
+                "addr": f"{ea:#x}",
+                "class_name": data.get("class_name", ""),
+                "entries": entries,
+            })
         except Exception as e:
             results.append({"addr": addr_str, "error": str(e)})
     return results
