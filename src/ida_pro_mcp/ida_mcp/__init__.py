@@ -31,14 +31,7 @@ from . import api_memory
 from . import api_types
 from . import api_modify
 from . import api_stack
-# Optional: VTableExplorer integration (only if plugin is loaded)
-try:
-    import idc as _idc
-    _probe = _idc.eval_idc("VTableExplorer_Scan()")
-    if isinstance(_probe, str) and "IDC_FAILURE" not in _probe:
-        from . import api_vtable
-except Exception:
-    pass
+from . import api_vtable
 from . import api_debug
 from . import api_python
 from . import api_resources
@@ -61,6 +54,7 @@ __all__ = [
     "api_types",
     "api_modify",
     "api_stack",
+    "api_vtable",
     "api_debug",
     "api_python",
     "api_resources",
