@@ -53,8 +53,8 @@ def _get_tool_timeout_seconds() -> float:
 call_stack = queue.LifoQueue()
 
 
-def _sync_wrapper(ff):
-    """Call a function ff with a specific IDA safety_mode."""
+def _sync_wrapper(ff, flags=idaapi.MFF_WRITE):
+    """Call a function ff on the IDA main thread with the given lock mode."""
 
     res_container = queue.Queue()
 
@@ -75,7 +75,7 @@ def _sync_wrapper(ff):
             idc.batch(old_batch)
             call_stack.get()
 
-    idaapi.execute_sync(runned, idaapi.MFF_WRITE)
+    idaapi.execute_sync(runned, flags)
     res = res_container.get()
     if isinstance(res, Exception):
         raise res
@@ -91,7 +91,7 @@ def _normalize_timeout(value: object) -> float | None:
         return None
 
 
-def sync_wrapper(ff, timeout_override: float | None = None):
+def sync_wrapper(ff, timeout_override: float | None = None, flags=idaapi.MFF_WRITE):
     """Wrapper to enable timeout and cancellation during IDA synchronization.
 
     Note: Batch mode is now handled in _sync_wrapper to ensure it's always
@@ -125,17 +125,15 @@ def sync_wrapper(ff, timeout_override: float | None = None):
                 sys.setprofile(old_profile)
 
         timed_ff.__name__ = ff.__name__
-        return _sync_wrapper(timed_ff)
-    return _sync_wrapper(ff)
+        return _sync_wrapper(timed_ff, flags)
+    return _sync_wrapper(ff, flags)
 
 
 def idasync(f):
-    """Run the function on the IDA main thread in write mode.
+    """Run the function on the IDA main thread with exclusive write lock (MFF_WRITE).
 
-    This is the unified decorator for all IDA synchronization.
-    Previously there were separate @idaread and @idawrite decorators,
-    but since read-only operations in IDA might actually require write
-    access (e.g., decompilation), we now use a single decorator.
+    Use for operations that modify the IDB: renaming, patching, type changes,
+    decompilation (Hex-Rays may update caches), and arbitrary code execution.
     """
 
     @functools.wraps(f)
@@ -145,7 +143,27 @@ def idasync(f):
         timeout_override = _normalize_timeout(
             getattr(f, "__ida_mcp_timeout_sec__", None)
         )
-        return sync_wrapper(ff, timeout_override)
+        return sync_wrapper(ff, timeout_override, flags=idaapi.MFF_WRITE)
+
+    return wrapper
+
+
+def idaread(f):
+    """Run the function on the IDA main thread with shared read lock (MFF_READ).
+
+    Use for operations that only query the IDB without modifying it:
+    listing functions, reading memory, cross-references, disassembly, etc.
+    Reduces lock contention when multiple clients query simultaneously.
+    """
+
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        ff = functools.partial(f, *args, **kwargs)
+        ff.__name__ = f.__name__
+        timeout_override = _normalize_timeout(
+            getattr(f, "__ida_mcp_timeout_sec__", None)
+        )
+        return sync_wrapper(ff, timeout_override, flags=idaapi.MFF_READ)
 
     return wrapper
 

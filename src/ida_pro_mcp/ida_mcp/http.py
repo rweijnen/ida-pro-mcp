@@ -6,7 +6,7 @@ from urllib.parse import urlparse, parse_qs
 from typing import TypeVar, cast
 from http.server import HTTPServer
 
-from .sync import idasync
+from .sync import idaread, idasync
 from .rpc import (
     McpRpcRegistry,
     McpHttpRequestHandler,
@@ -19,7 +19,7 @@ from .rpc import (
 T = TypeVar("T")
 
 
-@idasync
+@idaread
 def config_json_get(key: str, default: T) -> T:
     node = ida_netnode.netnode(f"$ ida_mcp.{key}")
     json_blob: bytes | None = node.getblob(0, "C")

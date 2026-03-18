@@ -31,12 +31,13 @@ from . import api_memory
 from . import api_types
 from . import api_modify
 from . import api_stack
+from . import api_vtable
 from . import api_debug
 from . import api_python
 from . import api_resources
 
 # Re-export key components for external use
-from .sync import idasync, IDAError, IDASyncError, CancelledError
+from .sync import idasync, idaread, IDAError, IDASyncError, CancelledError
 from .rpc import MCP_SERVER, MCP_UNSAFE, tool, unsafe, resource
 from .http import IdaMcpHttpRequestHandler
 from .api_core import init_caches
@@ -53,11 +54,13 @@ __all__ = [
     "api_types",
     "api_modify",
     "api_stack",
+    "api_vtable",
     "api_debug",
     "api_python",
     "api_resources",
     # Re-exported components
     "idasync",
+    "idaread",
     "IDAError",
     "IDASyncError",
     "CancelledError",
