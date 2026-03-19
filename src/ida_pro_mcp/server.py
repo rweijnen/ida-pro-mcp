@@ -1772,6 +1772,10 @@ def install_ida_plugin(
                 shutil.copytree(pkg_source, pkg_destination)
                 installed_items.append(f"package: {pkg_destination}")
 
+        # Clear stale tools cache so the MCP proxy picks up new/removed tools
+        if installed_items and os.path.exists(_IDA_TOOLS_CACHE_FILE):
+            os.remove(_IDA_TOOLS_CACHE_FILE)
+
         if not quiet:
             if installed_items:
                 print("Installed IDA Pro plugin (IDA restart required)")
