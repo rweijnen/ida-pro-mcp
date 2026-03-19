@@ -5,6 +5,10 @@ Fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) with add
 - **Auto-start plugin** — MCP server starts automatically when IDA opens (no Ctrl+Alt+M needed)
 - **`load_binary` tool** — AI clients can spawn new IDA instances directly
 - **Multi-instance improvements** — more reliable discovery with increased probe timeout
+- **Large response pagination** — `decompile`, `get_bytes`, and `xrefs_to_field` support `max_lines`/`offset` for incremental reading
+- **Read/write lock splitting** — read-only tools use `MFF_READ` (shared lock) instead of `MFF_WRITE`, reducing contention under concurrent access
+- **VTableExplorer integration** — MCP tools for C++ vtable analysis (requires [VTableExplorer](https://github.com/K4ryuu/IDA-VTableExplorer) plugin)
+- **Connection pooling & timeout fixes** — HTTP keep-alive and aligned client/server timeouts
 
 Simple [MCP Server](https://modelcontextprotocol.io/introduction) to allow vibe reversing in IDA Pro.
 
@@ -167,6 +171,40 @@ The `load_binary` tool spawns IDA and returns immediately with the PID and a lis
 When multiple instances are active, tool responses are tagged with `[instance: <binary> @ port <N>]` so the AI can verify it is querying the correct binary. The MCP server also injects instructions into the initialize response to guide AI clients on multi-instance workflow and effective use of IDA tools.
 
 **Windows port safety:** On Windows, `SO_EXCLUSIVEADDRUSE` prevents multiple IDA instances from silently sharing the same port (a common `SO_REUSEADDR` pitfall on Windows).
+
+## Large Response Pagination
+
+Some tools produce large outputs that can overwhelm LLM context windows. The following tools support incremental reading via `max_lines` and `offset` parameters:
+
+| Tool | Default lines | Pagination |
+|------|--------------|------------|
+| `decompile` | 200 | `max_lines` + `offset` for scrolling through long functions |
+| `get_bytes` | Inline ≤4096 bytes | Larger reads saved to temp file |
+| `xrefs_to_field` | All results | `offset` + `count` |
+
+**Tip:** For unknown functions, start with `decompile(addr, max_lines=200)` to preview, then request more with `offset` if needed.
+
+## Read/Write Lock Splitting
+
+By default, all IDA SDK calls run on the main thread via `execute_sync()`. This fork splits tools into two lock modes:
+
+- **`@idaread`** (MFF_READ, shared lock) — used by 48 read-only tools (decompile, disasm, xrefs, get_bytes, etc.). Multiple read operations can execute concurrently.
+- **`@idasync`** (MFF_WRITE, exclusive lock) — used by 25 mutating tools (rename, patch, set_type, etc.). These still acquire an exclusive lock.
+
+This reduces contention when multiple AI clients query the same IDA instance simultaneously. Read-only operations no longer block each other.
+
+## VTableExplorer Integration
+
+If the [VTableExplorer](https://github.com/K4ryuu/IDA-VTableExplorer) IDA plugin is loaded, four additional MCP tools become available automatically:
+
+| Tool | Description |
+|------|-------------|
+| `vtable_scan` | Scan all vtables in the binary (filterable by class name, paginated) |
+| `vtable_entries` | Get vtable function entries for specific vtable address(es) |
+| `vtable_compare` | Compare derived and base class vtables (overrides, new virtuals) |
+| `vtable_hierarchy` | Get class hierarchy tree for a given class name |
+
+The tools are always registered in the MCP tool list. If VTableExplorer isn't loaded, they return a clear error when called. Output uses a compact format by default to minimize token usage.
 
 ## SSE Transport & Headless MCP
 
@@ -362,6 +400,15 @@ http://127.0.0.1:13337/mcp?ext=dbg
 - **Cursor-based pagination**: Search functions return `cursor: {next: offset}` or `{done: true}` (default limit: 1000, enforced max: 10000 to prevent token overflow)
 - **Performance**: Strings are cached with MD5-based invalidation to avoid repeated `build_strlist` calls in large projects
 - **Token efficiency**: JSON responses to LLM clients are minified (~28% smaller for structured data like function lists)
+- **Concurrency**: Read-only tools use shared locks (`MFF_READ`), allowing parallel reads from multiple clients
+- **Pagination**: Large responses (decompilation, bytes, xrefs) support `max_lines`/`offset` to avoid context window overflow
+
+## VTable Operations (requires VTableExplorer plugin)
+
+- `vtable_scan(filter, count, offset)`: Scan all vtables, optionally filtered by class name pattern (paginated).
+- `vtable_entries(addrs)`: Get vtable function entries for one or more vtable addresses.
+- `vtable_compare(derived, base)`: Compare derived vs base class vtable (shows overrides and new virtuals).
+- `vtable_hierarchy(class_name)`: Get inheritance hierarchy tree for a class.
 
 ## Comparison with other MCP servers
 
