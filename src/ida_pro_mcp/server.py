@@ -229,6 +229,10 @@ def get_active_instance() -> dict:
 # load_binary - spawn a new IDA instance
 # ============================================================================
 
+from ida_pro_mcp.binfmt import probe_binary as _probe_binary
+from ida_pro_mcp.loader_args import LoaderArgError, build_loader_args
+from ida_pro_mcp.processors import list_processors as _list_processors
+
 _IDA_MCP_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".ida_mcp")
 _IDA_MCP_CONFIG_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "config.json")
 _IDA_TOOLS_CACHE_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "tools_cache.json")
@@ -263,7 +267,53 @@ def _load_tools_cache() -> list:
 
 
 @mcp.tool
-def load_binary(binary_path: str, fresh_db: bool = False) -> dict:
+def list_processors(family: str | None = None) -> dict:
+    """List IDA processor type names for use with load_binary(processor=...).
+
+    Only needed for headerless/raw binaries. For PE, ELF and Mach-O the loader
+    selects the processor itself -- call probe_binary first to check.
+
+    Note these are IDA's processor *names*, which differ from the module
+    filenames in IDA's procs/ directory (x86's module is 'pc', the name is
+    'metapc'). Names are case-sensitive: 'ColdFire' works, 'colfire' does not.
+
+    Args:
+        family: Optional family filter, e.g. "ARM", "MIPS", "TriCore".
+    """
+    entries = _list_processors(family)
+    if not entries:
+        known = sorted({e["family"] for e in _list_processors()})
+        return {"error": f"Unknown family {family!r}. Known: {', '.join(known)}"}
+    return {"processors": entries, "count": len(entries)}
+
+
+@mcp.tool
+def probe_binary(binary_path: str) -> dict:
+    """Detect a binary's format before loading it, to decide on loader options.
+
+    Call this before load_binary when you are unsure what a file is. It runs in
+    the MCP server itself, so it works with no IDA instance running.
+
+    Returns the detected format and, for recognized formats, the processor IDA
+    will select -- along with explicit advice on whether to pass loader options.
+
+    Args:
+        binary_path: Absolute path to the file to inspect.
+    """
+    if not os.path.isabs(binary_path):
+        return {"error": f"binary_path must be absolute, got: {binary_path}"}
+    return _probe_binary(binary_path)
+
+
+@mcp.tool
+def load_binary(
+    binary_path: str,
+    processor: str | None = None,
+    file_type: str | None = None,
+    load_base: int | None = None,
+    entry_point: int | None = None,
+    fresh_db: bool = False,
+) -> dict:
     """Open a binary in a new IDA Pro instance. The MCP plugin auto-starts.
 
     Spawns IDA Pro with the given binary and returns immediately.
@@ -272,16 +322,26 @@ def load_binary(binary_path: str, fresh_db: bool = False) -> dict:
     Poll list_instances in a background task to detect when it's ready.
 
     IDA runs in autonomous mode (-A): no dialogs are shown and the default
-    answer is taken for each. For recognized formats (PE/ELF/Mach-O) the
-    loader picks the correct processor, so the defaults are right.
+    answer is taken for each.
 
-    WARNING: for a raw/headerless blob the default loader choice is likely
-    wrong, and you get a silently mis-loaded database rather than a visible
-    error. Specifying the processor, image base and file type is not
-    supported yet -- load such files manually in IDA for now.
+    For recognized formats (PE/ELF/Mach-O) pass ONLY binary_path -- the loader
+    selects the processor and base correctly, and overriding them is more
+    likely to corrupt the load than improve it.
+
+    For a raw/headerless blob the defaults (binary loader, metapc, base 0) are
+    almost certainly wrong and fail SILENTLY -- you get a confidently wrong
+    database rather than an error. Call probe_binary first; if it reports the
+    file is unrecognized, pass file_type="binary" plus the correct processor
+    and load_base.
 
     Args:
         binary_path: Absolute path to the binary file to analyze.
+        processor: IDA processor name, e.g. "tricore", "mipsb", or with ARM
+            options "arm:ARMv7-A;NEON". See list_processors. Only the ARM
+            module accepts an option suffix.
+        file_type: Loader/format prefix, e.g. "binary" for a headerless blob.
+        load_base: Byte address to load at. Must be 16-byte aligned.
+        entry_point: Initial entry point address.
         fresh_db: Discard any existing .i64 and re-analyze from scratch.
             By default an existing database is reused (and opened without
             prompting).
@@ -320,13 +380,26 @@ def load_binary(binary_path: str, fresh_db: bool = False) -> dict:
     # Record existing ports before spawning
     pre_spawn = [inst.port for inst in instance_manager.discover()]
 
+    # Build loader args first: an invalid -p option string is FATAL in IDA, so
+    # validating here is what stops a bad value from taking the new instance down.
+    try:
+        loader_args = build_loader_args(
+            processor=processor,
+            file_type=file_type,
+            load_base=load_base,
+            entry_point=entry_point,
+            fresh_db=fresh_db,
+        )
+    except LoaderArgError as e:
+        return {"error": str(e)}
+
     # Spawn IDA. -A is autonomous mode: no dialogs, default answer to each.
     # Without it the "Load a new file" dialog blocks the load indefinitely,
     # since an agent can neither see nor dismiss it.
-    argv = [ida_exe, "-A"]
-    if fresh_db:
-        argv.append("-c")  # delete any existing database first
-    argv.append(binary_path)
+    #
+    # Note argv is passed as a list, never through a shell: ARM option strings
+    # contain ';', which PowerShell would treat as a statement separator.
+    argv = [ida_exe, "-A", *loader_args, binary_path]
 
     try:
         proc = subprocess.Popen(argv)
@@ -337,6 +410,7 @@ def load_binary(binary_path: str, fresh_db: bool = False) -> dict:
         "status": "spawned",
         "pid": proc.pid,
         "binary_path": binary_path,
+        "loader_args": loader_args,
         "pre_existing_ports": pre_spawn,
     }
 
@@ -376,7 +450,14 @@ TOKEN EFFICIENCY:
 """
 
 # Tools handled locally by the MCP server (not forwarded to IDA plugin)
-_LOCAL_TOOLS = {"list_instances", "switch_instance", "get_active_instance", "load_binary"}
+_LOCAL_TOOLS = {
+    "list_instances",
+    "switch_instance",
+    "get_active_instance",
+    "load_binary",
+    "list_processors",
+    "probe_binary",
+}
 
 
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
