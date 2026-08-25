@@ -5,6 +5,7 @@ import shutil
 import argparse
 import http.client
 import subprocess
+import time
 import tempfile
 import traceback
 import tomllib
@@ -246,6 +247,45 @@ _IDA_MCP_CONFIG_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "config.json")
 _IDA_TOOLS_CACHE_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "tools_cache.json")
 
 
+#: Packed databases, plus the unpacked components IDA leaves when it is killed
+#: rather than closed cleanly. Any of them counts as an existing database.
+_DB_SUFFIXES = (".i64", ".idb", ".id0", ".id1", ".id2", ".nam", ".til")
+
+
+def _existing_database(binary_path: str) -> str | None:
+    """Return the path of an existing database for this binary, if any."""
+    for suffix in _DB_SUFFIXES:
+        candidate = binary_path + suffix
+        if os.path.exists(candidate):
+            return candidate
+    stem = os.path.splitext(binary_path)[0]
+    for suffix in (".i64", ".idb"):
+        candidate = stem + suffix
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _wait_for_new_instance(
+    known_ports: set[int], timeout: float, proc: "subprocess.Popen | None" = None
+) -> "IDAInstance | None":
+    """Wait for a newly spawned IDA to publish its MCP port.
+
+    Returns the new instance, or None on timeout / if the process died first.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for inst in instance_manager.discover():
+            if inst.port not in known_ports:
+                return inst
+        # A spawn that dies (rejected loader args, locked database) will never
+        # publish a port; stop early rather than burning the whole timeout.
+        if proc is not None and proc.poll() is not None:
+            return None
+        time.sleep(2.0)
+    return None
+
+
 def _unused_idb_path(binary_path: str) -> str:
     """Pick a database path for an additional instance of an already-open binary."""
     stem = f"{binary_path}.mcp"
@@ -368,6 +408,8 @@ def load_binary(
     idb_path: str | None = None,
     new_instance: bool = False,
     fresh_db: bool = False,
+    wait: bool = True,
+    wait_timeout: float = 180.0,
 ) -> dict:
     """Open a binary in a new IDA Pro instance. The MCP plugin auto-starts.
 
@@ -421,6 +463,13 @@ def load_binary(
         fresh_db: Discard any existing .i64 and re-analyze from scratch.
             By default an existing database is reused (and opened without
             prompting).
+        wait: Wait for the new instance to come up and make it active, so no
+            polling of list_instances is needed. This waits only for IDA to
+            start (seconds to a minute), NOT for auto-analysis, which can take
+            far longer -- check analysis_status for that.
+        wait_timeout: Give up waiting for the instance after this long. The
+            spawn is not cancelled; list_instances will show it if it appears
+            later.
     """
     # Validate path
     if not os.path.isabs(binary_path):
@@ -479,6 +528,26 @@ def load_binary(
 
     if new_instance and idb_path is None:
         idb_path = _unused_idb_path(binary_path)
+
+    # Loader options only apply when a database is created. If one already
+    # exists, IDA exits immediately (rc=1) rather than reporting a conflict, so
+    # catch it here -- silently ignoring the options would be worse.
+    wants_loader_opts = any(
+        v is not None for v in (processor, file_type, load_base, entry_point, device)
+    )
+    if wants_loader_opts and not fresh_db and idb_path is None:
+        existing = _existing_database(binary_path)
+        if existing:
+            return {
+                "error": (
+                    f"Loader options were given, but a database already exists "
+                    f"({os.path.basename(existing)}). IDA applies these only when "
+                    f"creating a database and refuses to start otherwise. Pass "
+                    f"fresh_db=True to discard it and re-analyze, or drop the loader "
+                    f"options to open the existing database as-is."
+                ),
+                "existing_database": existing,
+            }
 
     # Validate the device against the processor's config before spawning. IDA
     # ignores an unknown device SILENTLY, producing a database with no memory
@@ -543,6 +612,46 @@ def load_binary(
         "loader_args": loader_args,
         "pre_existing_ports": pre_spawn,
     }
+
+    # Wait for the instance to publish its port, then make it active. This is
+    # the window where IDA is starting up and the plugin has not yet bound a
+    # port, so the instance is invisible to list_instances -- bounded and short
+    # (typically 10-60s), unlike auto-analysis, which is not waited for here.
+    if wait:
+        appeared = _wait_for_new_instance(set(pre_spawn), wait_timeout, proc)
+        if appeared is None:
+            exit_code = proc.poll()
+            if exit_code is not None:
+                result["status"] = "failed"
+                result["exit_code"] = exit_code
+                result["error"] = (
+                    f"IDA exited with code {exit_code} before publishing a port, so "
+                    f"the load failed. Usual causes: loader options rejected (an "
+                    f"invalid processor option is fatal), or a database that is "
+                    f"locked or already exists. Loader args were: "
+                    f"{' '.join(loader_args) or '(none)'}"
+                )
+            else:
+                result["status"] = "timeout"
+                result["error"] = (
+                    f"No instance appeared within {wait_timeout:g}s, but IDA is still "
+                    f"running -- it may be loading a large binary. The spawn was not "
+                    f"cancelled; call list_instances to check for it."
+                )
+            return result
+        instance_manager.active_port = appeared.port
+        result["status"] = "ready"
+        result["port"] = appeared.port
+        result["processor"] = appeared.processor
+        result["bits"] = appeared.bits
+        result["analysis_complete"] = appeared.analysis_complete
+        result["active"] = True
+        if not appeared.analysis_complete:
+            result["next"] = (
+                "Auto-analysis is still running, so results are incomplete. Use "
+                "wait_for_analysis for a short binary, or get on with other work and "
+                "check analysis_status -- do not sit in a polling loop."
+            )
     if idb_path is not None:
         result["idb_path"] = idb_path
     if device is not None:
