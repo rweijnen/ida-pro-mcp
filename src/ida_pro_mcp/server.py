@@ -263,7 +263,7 @@ def _load_tools_cache() -> list:
 
 
 @mcp.tool
-def load_binary(binary_path: str) -> dict:
+def load_binary(binary_path: str, fresh_db: bool = False) -> dict:
     """Open a binary in a new IDA Pro instance. The MCP plugin auto-starts.
 
     Spawns IDA Pro with the given binary and returns immediately.
@@ -271,8 +271,20 @@ def load_binary(binary_path: str) -> dict:
     and the MCP plugin starts (typically 10-60s, longer for large binaries).
     Poll list_instances in a background task to detect when it's ready.
 
+    IDA runs in autonomous mode (-A): no dialogs are shown and the default
+    answer is taken for each. For recognized formats (PE/ELF/Mach-O) the
+    loader picks the correct processor, so the defaults are right.
+
+    WARNING: for a raw/headerless blob the default loader choice is likely
+    wrong, and you get a silently mis-loaded database rather than a visible
+    error. Specifying the processor, image base and file type is not
+    supported yet -- load such files manually in IDA for now.
+
     Args:
         binary_path: Absolute path to the binary file to analyze.
+        fresh_db: Discard any existing .i64 and re-analyze from scratch.
+            By default an existing database is reused (and opened without
+            prompting).
     """
     # Validate path
     if not os.path.isabs(binary_path):
@@ -308,9 +320,16 @@ def load_binary(binary_path: str) -> dict:
     # Record existing ports before spawning
     pre_spawn = [inst.port for inst in instance_manager.discover()]
 
-    # Spawn IDA
+    # Spawn IDA. -A is autonomous mode: no dialogs, default answer to each.
+    # Without it the "Load a new file" dialog blocks the load indefinitely,
+    # since an agent can neither see nor dismiss it.
+    argv = [ida_exe, "-A"]
+    if fresh_db:
+        argv.append("-c")  # delete any existing database first
+    argv.append(binary_path)
+
     try:
-        proc = subprocess.Popen([ida_exe, binary_path])
+        proc = subprocess.Popen(argv)
     except Exception as e:
         return {"error": f"Failed to launch IDA: {e}"}
 
