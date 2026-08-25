@@ -29,6 +29,7 @@ def build_loader_args(
     file_type: str | None = None,
     load_base: int | None = None,
     entry_point: int | None = None,
+    device: str | None = None,
     fresh_db: bool = False,
     extra: list[str] | None = None,
 ) -> list[str]:
@@ -41,6 +42,10 @@ def build_loader_args(
         load_base: Byte address to load at. Must be 16-byte aligned, since -b encodes
             paragraphs.
         entry_point: Initial entry point / IP for -i.
+        device: MCU device / chip variant, e.g. "tc37x", emitted as -DDEVICE=. Use the
+            LEAF name, not the group path ("tc37x", not "tc3xx/tc37x"). "NONE" selects
+            no device. Callers should validate against list_devices first: IDA ignores
+            an unknown device silently, producing a database with no memory map.
         fresh_db: Discard any existing database first (-c).
         extra: Raw arguments appended verbatim. Escape hatch; not validated.
 
@@ -84,6 +89,17 @@ def build_loader_args(
                 f"entry_point must be non-negative, got {entry_point:#x}"
             )
         args.append(f"-i{_hex(entry_point)}")
+
+    if device is not None:
+        device = device.strip()
+        if not device:
+            raise LoaderArgError("device must be a non-empty string")
+        if "/" in device:
+            raise LoaderArgError(
+                f"device {device!r} looks like a group path. IDA matches the leaf name "
+                f"only -- use {device.rsplit('/', 1)[-1]!r}."
+            )
+        args.append(f"-DDEVICE={device}")
 
     if extra:
         args.extend(extra)

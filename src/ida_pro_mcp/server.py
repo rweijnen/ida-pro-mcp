@@ -230,7 +230,9 @@ def get_active_instance() -> dict:
 # ============================================================================
 
 from ida_pro_mcp.binfmt import probe_binary as _probe_binary
+from ida_pro_mcp.devices import list_devices as _list_devices
 from ida_pro_mcp.loader_args import LoaderArgError, build_loader_args
+from ida_pro_mcp.processors import PROCESSORS as _PROCESSOR_NAMES
 from ida_pro_mcp.processors import list_processors as _list_processors
 
 _IDA_MCP_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".ida_mcp")
@@ -288,6 +290,40 @@ def list_processors(family: str | None = None) -> dict:
 
 
 @mcp.tool
+def list_devices(processor: str) -> dict:
+    """List MCU device (chip variant) names for load_binary(device=...).
+
+    Many MCU processor modules cover a family whose members differ in memory
+    layout and peripheral registers. IDA normally asks which one via a dialog
+    at database creation -- but that dialog is invisible in autonomous mode, so
+    without an explicit device the module default is used silently. For TriCore
+    that default is tc1766, meaning a TC3xx image gets a TC1766 memory map.
+
+    Use the LEAF name from this list ("tc37x"), not the group path
+    ("tc3xx/tc37x"). An unknown device name is ignored by IDA SILENTLY and
+    produces a database with no memory map at all.
+
+    Args:
+        processor: IDA processor name, e.g. "tricore", "avr", "8051".
+    """
+    config = _read_ida_config()
+    ida_dir = config.get("ida_dir")
+    if not ida_dir:
+        return {
+            "error": (
+                "IDA installation path not found. Start IDA once with the MCP "
+                f"plugin so it can write the config to {_IDA_MCP_CONFIG_FILE}"
+            )
+        }
+    if processor.lower() not in _PROCESSOR_NAMES:
+        return {
+            "error": f"Unknown processor {processor!r}. Use list_processors to see "
+                     f"valid names."
+        }
+    return _list_devices(ida_dir, processor)
+
+
+@mcp.tool
 def probe_binary(binary_path: str) -> dict:
     """Detect a binary's format before loading it, to decide on loader options.
 
@@ -312,6 +348,7 @@ def load_binary(
     file_type: str | None = None,
     load_base: int | None = None,
     entry_point: int | None = None,
+    device: str | None = None,
     fresh_db: bool = False,
 ) -> dict:
     """Open a binary in a new IDA Pro instance. The MCP plugin auto-starts.
@@ -342,6 +379,10 @@ def load_binary(
         file_type: Loader/format prefix, e.g. "binary" for a headerless blob.
         load_base: Byte address to load at. Must be 16-byte aligned.
         entry_point: Initial entry point address.
+        device: MCU device / chip variant, e.g. "tc37x". Required for correct
+            memory layout and peripheral names on MCU targets -- without it
+            IDA silently uses the module default (tc1766 for TriCore). Use
+            list_devices to find valid names.
         fresh_db: Discard any existing .i64 and re-analyze from scratch.
             By default an existing database is reused (and opened without
             prompting).
@@ -380,14 +421,43 @@ def load_binary(
     # Record existing ports before spawning
     pre_spawn = [inst.port for inst in instance_manager.discover()]
 
-    # Build loader args first: an invalid -p option string is FATAL in IDA, so
-    # validating here is what stops a bad value from taking the new instance down.
+    # Validate the device against the processor's config before spawning. IDA
+    # ignores an unknown device SILENTLY, producing a database with no memory
+    # map -- so an unchecked typo here is invisible rather than an error.
+    if device is not None and device.upper() != "NONE":
+        if processor is None:
+            return {
+                "error": "device requires processor to be specified as well, since "
+                         "device names are per-processor."
+            }
+        base_proc = processor.split(":", 1)[0]
+        known = _list_devices(ida_dir, base_proc)
+        if known.get("devices") and device not in known["devices"]:
+            leaf = device.rsplit("/", 1)[-1]
+            if "/" in device and leaf in known["devices"]:
+                return {
+                    "error": f"device {device!r} is a group path. IDA matches the leaf "
+                             f"name only -- use {leaf!r}."
+                }
+            close = [d for d in known["devices"] if d.lower() == device.lower()]
+            hint = (
+                f" Did you mean {close[0]!r}? Device names are case-sensitive."
+                if close
+                else f" Valid devices: {', '.join(known['devices'][:40])}"
+            )
+            return {
+                "error": f"Unknown device {device!r} for processor {base_proc!r}.{hint}"
+            }
+
+    # Build loader args: an invalid -p option string is FATAL in IDA, so validating
+    # here is what stops a bad value from taking the new instance down.
     try:
         loader_args = build_loader_args(
             processor=processor,
             file_type=file_type,
             load_base=load_base,
             entry_point=entry_point,
+            device=device,
             fresh_db=fresh_db,
         )
     except LoaderArgError as e:
@@ -456,6 +526,7 @@ _LOCAL_TOOLS = {
     "get_active_instance",
     "load_binary",
     "list_processors",
+    "list_devices",
     "probe_binary",
 }
 
