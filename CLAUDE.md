@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for working in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this project is
 
@@ -21,19 +21,27 @@ Important API modules:
 - `api_debug.py`: debugger control, unsafe / low priority for tests
 - `api_python.py`: execute Python in IDA context
 - `api_resources.py`: `ida://` MCP resources
+- `api_vtable.py`: vtable scanning, entries, hierarchy (requires VTableExplorer plugin)
 
 ## Core implementation rules
 
 ### IDA thread safety
 All IDA SDK calls must run on the main thread.
-Use:
+
+Read-only tools use the shared read lock (`@idaread`); mutating tools use the exclusive write lock (`@idasync`). Prefer `@idaread` where possible to allow concurrent reads.
+
 ```python
 from .rpc import tool
-from .sync import idasync
+from .sync import idasync, idaread
 
 @tool
-@idasync
-def my_tool(...):
+@idaread          # shared lock — use for read-only queries
+def my_query(...):
+    ...
+
+@tool
+@idasync          # exclusive write lock — use for mutations
+def my_mutation(...):
     ...
 ```
 
@@ -83,9 +91,20 @@ uv run mcp dev src/ida_pro_mcp/server.py
 ```
 
 ### Install / uninstall
+
+To install or update from the GitHub repo and register the IDA plugin + MCP clients:
 ```bash
-uv run ida-pro-mcp --install
-uv run ida-pro-mcp --uninstall
+pip install https://github.com/rweijnen/ida-pro-mcp/archive/refs/heads/main.zip
+ida-pro-mcp --install claude --scope global --transport stdio
+```
+
+The `--transport stdio` flag is required so Claude runs `server.py` as a subprocess (the proxy layer). Without it you get a direct HTTP connection to IDA that lacks `load_binary`, `list_instances`, and other proxy-side tools.
+
+**IDA must be restarted after `--install`** for the plugin to take effect.
+
+To uninstall:
+```bash
+ida-pro-mcp --uninstall claude --scope global
 ```
 
 ## Testing and coverage
@@ -103,6 +122,7 @@ Notes:
 - Use `uv run ...`
 - Non-interactive output should show failures only plus a summary
 - Binary-specific tests should use `@test(binary="...")` with the executable basename
+- `--isolated-contexts` gives each idalib-mcp request its own IDA context (stateless, safe for concurrent use)
 
 ### Coverage
 Measure coverage across both maintained fixtures:
@@ -116,6 +136,12 @@ uv run coverage report --show-missing
 Current fixture intent:
 - `tests/crackme03.elf`: compact general regression fixture
 - `tests/typed_fixture.elf`: typed globals / structs / locals / stack coverage fixture
+
+### Test framework helpers
+From `framework.py`:
+- `assert_shape(value, schema)` — validates nested dicts/lists; use `optional()`, `list_of()`, `one_of()` as schema matchers
+- `assert_ok(result)` / `assert_error(result)` — validates tool response status
+- `get_any_function()`, `get_named_function(name)`, `get_data_address()` — returns addresses from the loaded binary
 
 ### Test expectations
 - Prefer semantic assertions, not weak "field exists" checks
@@ -140,6 +166,7 @@ High priority:
 - `api_memory.py`
 - `api_core.py`
 - `api_resources.py`
+- `api_vtable.py`
 - `utils.py`
 - `framework.py`
 

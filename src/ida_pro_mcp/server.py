@@ -1500,7 +1500,7 @@ def list_available_clients():
         "  ida-pro-mcp --install vscode --scope project              # Project-level config"
     )
     print(
-        "  ida-pro-mcp --install cursor --transport streamable-http  # Streamable HTTP config"
+        "  ida-pro-mcp --install cursor --transport streamable-http  # Direct HTTP (no proxy tools)"
     )
     print(
         "  ida-pro-mcp --uninstall cursor                            # Uninstall specific target"
@@ -1802,23 +1802,11 @@ def _interactive_install(*, uninstall: bool, args):
     """Full interactive install/uninstall flow with transport and scope selection."""
     action = "uninstall" if uninstall else "install"
 
-    # Step 1: Transport selection (skip for uninstall, or if --transport was explicitly set)
-    if not uninstall and args.transport is None:
-        choice = interactive_choose(
-            ["Streamable HTTP (recommended)", "stdio", "SSE"],
-            "Select transport mode:",
-        )
-        if choice is None:
-            print("Cancelled.")
-            return
-        if choice.startswith("stdio"):
-            transport = "stdio"
-        elif choice.startswith("Streamable"):
-            transport = "streamable-http"
-        else:
-            transport = "sse"
-    elif not uninstall:
-        transport = _resolve_transport(args.transport or "streamable-http")
+    # Step 1: Transport selection
+    # Always default to stdio so the MCP proxy layer is active (required for load_binary,
+    # list_instances, etc.). Power users can override with --transport.
+    if not uninstall:
+        transport = _resolve_transport(args.transport or "stdio")
     else:
         transport = "stdio"  # doesn't matter for uninstall
 
@@ -1926,7 +1914,8 @@ def main():
         "--transport",
         type=str,
         default=None,
-        help="MCP transport for install: 'streamable-http' (default), 'stdio', or 'sse'. "
+        help="MCP transport for install: 'stdio' (default), 'streamable-http', or 'sse'. "
+        "stdio is required for proxy tools (load_binary, list_instances, etc.). "
         "For running: use stdio (default) or pass a URL (e.g., http://127.0.0.1:8744[/mcp|/sse])",
     )
     parser.add_argument(
@@ -1987,7 +1976,7 @@ def main():
         if targets_str:
             # Explicit targets: --install claude,cursor,ida-plugin
             # Use CLI flags for transport/scope (no interactive prompts)
-            transport = _resolve_transport(args.transport or "streamable-http")
+            transport = _resolve_transport(args.transport or "stdio")
             scope = args.scope or "project"
 
             targets = [t.strip() for t in targets_str.split(",") if t.strip()]
