@@ -10,10 +10,37 @@ Verified against IDA 9.4; see docs/headless-loading-plan.md for the test results
 behind the encoding rules below.
 """
 
+import os
+
 from .processors import PROCESSORS, split_processor_spec, validate_arm_options
 
 # -b takes PARAGRAPHS, not bytes: byte address = value * 16.
 PARAGRAPH_SIZE = 16
+
+#: Packed databases, plus the unpacked components IDA leaves behind when it is killed
+#: rather than closed cleanly. Any of them means a database already exists.
+DB_SUFFIXES = (".i64", ".idb", ".id0", ".id1", ".id2", ".nam", ".til")
+
+
+def existing_database(binary_path: str) -> str | None:
+    """Return the path of an existing database for this binary, if any.
+
+    Loader options apply only when a database is created. Applying them to an existing
+    one is refused by IDA in a way that is hard to diagnose after the fact: the GUI
+    exits with code 1 and no message, and idalib raises a FATAL error that terminates
+    the process ("Switch '-b...' can be used only when loading a new file"). Callers
+    should check this first and tell the user to rebuild instead.
+    """
+    for suffix in DB_SUFFIXES:
+        candidate = binary_path + suffix
+        if os.path.exists(candidate):
+            return candidate
+    stem = os.path.splitext(binary_path)[0]
+    for suffix in (".i64", ".idb"):
+        candidate = stem + suffix
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 class LoaderArgError(ValueError):

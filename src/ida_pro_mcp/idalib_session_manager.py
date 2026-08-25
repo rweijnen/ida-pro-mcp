@@ -27,6 +27,7 @@ class IDASession:
     created_at: datetime = field(default_factory=datetime.now)
     last_accessed: datetime = field(default_factory=datetime.now)
     is_analyzing: bool = False
+    loader_args: list = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -38,6 +39,7 @@ class IDASession:
             "created_at": self.created_at.isoformat(),
             "last_accessed": self.last_accessed.isoformat(),
             "is_analyzing": self.is_analyzing,
+            "loader_args": self.loader_args,
             "metadata": self.metadata,
         }
 
@@ -63,6 +65,7 @@ class IDASessionManager:
         input_path: Path | str,
         run_auto_analysis: bool = True,
         session_id: Optional[str] = None,
+        loader_args: Optional[list[str]] = None,
     ) -> str:
         """Open a binary file and create a new session
 
@@ -70,6 +73,10 @@ class IDASessionManager:
             input_path: Path to the binary file
             run_auto_analysis: Whether to run auto-analysis
             session_id: Optional custom session ID (auto-generated if not provided)
+            loader_args: IDA loader arguments (-p/-T/-b/-i/-DDEVICE=/-c), applied only
+                when the database is created. They are recorded on the session for
+                reference but deliberately NOT replayed when the database is later
+                reopened, since loader options only apply at creation time.
 
         Returns:
             Session ID for the opened binary
@@ -99,13 +106,16 @@ class IDASessionManager:
 
             # Open the database
             logger.info(f"Opening database: {input_path} (session: {session_id})")
-            self._activate_database_path(str(input_path), run_auto_analysis)
+            self._activate_database_path(
+                str(input_path), run_auto_analysis, loader_args
+            )
 
             # Create session object
             session = IDASession(
                 session_id=session_id,
                 input_path=input_path,
                 is_analyzing=run_auto_analysis,
+                loader_args=list(loader_args) if loader_args else [],
             )
 
             self._sessions[session_id] = session
@@ -275,14 +285,25 @@ class IDASessionManager:
         self._active_session_id = session_id
         logger.info("Activated session %s (%s)", session_id, session.input_path.name)
 
-    def _activate_database_path(self, input_path: str, run_auto_analysis: bool) -> None:
+    def _activate_database_path(
+        self,
+        input_path: str,
+        run_auto_analysis: bool,
+        loader_args: Optional[list[str]] = None,
+    ) -> None:
         if self._active_session_id is not None:
             logger.debug("Closing active database before opening %s", input_path)
             idapro.close_database()
             self._active_session_id = None
 
-        if idapro.open_database(input_path, run_auto_analysis=run_auto_analysis):
-            raise RuntimeError(f"Failed to open database: {input_path}")
+        args = " ".join(loader_args) if loader_args else None
+        if idapro.open_database(
+            input_path, run_auto_analysis=run_auto_analysis, args=args
+        ):
+            raise RuntimeError(
+                f"Failed to open database: {input_path}"
+                + (f" (loader args: {args})" if args else "")
+            )
 
     def _unbind_session_everywhere_locked(self, session_id: str) -> None:
         stale_contexts = [

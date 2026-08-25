@@ -238,32 +238,17 @@ def get_active_instance() -> dict:
 
 from ida_pro_mcp.binfmt import probe_binary as _probe_binary
 from ida_pro_mcp.devices import list_devices as _list_devices
-from ida_pro_mcp.loader_args import LoaderArgError, build_loader_args
+from ida_pro_mcp.loader_args import (
+    LoaderArgError,
+    build_loader_args,
+    existing_database as _existing_database,
+)
 from ida_pro_mcp.processors import PROCESSORS as _PROCESSOR_NAMES
 from ida_pro_mcp.processors import list_processors as _list_processors
 
 _IDA_MCP_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".ida_mcp")
 _IDA_MCP_CONFIG_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "config.json")
 _IDA_TOOLS_CACHE_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "tools_cache.json")
-
-
-#: Packed databases, plus the unpacked components IDA leaves when it is killed
-#: rather than closed cleanly. Any of them counts as an existing database.
-_DB_SUFFIXES = (".i64", ".idb", ".id0", ".id1", ".id2", ".nam", ".til")
-
-
-def _existing_database(binary_path: str) -> str | None:
-    """Return the path of an existing database for this binary, if any."""
-    for suffix in _DB_SUFFIXES:
-        candidate = binary_path + suffix
-        if os.path.exists(candidate):
-            return candidate
-    stem = os.path.splitext(binary_path)[0]
-    for suffix in (".i64", ".idb"):
-        candidate = stem + suffix
-        if os.path.exists(candidate):
-            return candidate
-    return None
 
 
 def _wait_for_new_instance(
