@@ -11,12 +11,23 @@ Main pieces:
 - `src/ida_pro_mcp/idalib_server.py`: headless idalib server
 - `src/ida_pro_mcp/ida_mcp/`: IDA/plugin-side APIs
 
+Proxy-side modules (stdlib only, **must never import IDA**) — `server.py` runs outside
+IDA, so anything it needs lives here rather than in `ida_mcp/`:
+- `loader_args.py`: builds IDA loader command-line args (`-p`, `-T`, `-b`, `-i`, `-DDEVICE=`, `-o`, `-c`).
+  The same strings work for `ida.exe` argv and `idapro.open_database(args=...)`.
+- `processors.py`: curated processor-name table. Curated because IDA 9.4 exposes no way
+  to enumerate processors from Python (`idp_desc_t` is wrapped, `get_idp_descs()` is not).
+  Names are case-sensitive and are NOT the `procs/` filenames (x86's module is `pc`, the
+  name is `metapc`). Every name in it was validated by loading with `-p<name>`.
+- `devices.py`: parses MCU device names from `cfg/<proc>.cfg`.
+- `binfmt.py`: pre-load format detection (PE/ELF/Mach-O/DEX, plus blob detection).
+
 Important API modules:
-- `api_core.py`: IDB metadata, functions, strings, imports
+- `api_core.py`: IDB metadata, functions, strings, imports, auto-analysis progress
 - `api_analysis.py`: decompilation, disassembly, xrefs, paths, pattern search
 - `api_memory.py`: bytes/ints/strings, patching
 - `api_types.py`: structs, type inference, type application
-- `api_modify.py`: comments, renaming, asm patching
+- `api_modify.py`: comments, renaming, asm patching, ARM Thumb mode (`T` register)
 - `api_stack.py`: stack frame operations
 - `api_debug.py`: debugger control, unsafe / low priority for tests
 - `api_python.py`: execute Python in IDA context
@@ -44,6 +55,32 @@ def my_query(...):
 def my_mutation(...):
     ...
 ```
+
+A `@tool` without one of these runs on the HTTP handler thread, where SDK calls return
+wrong answers rather than failing. `idaapi.is_idaq()` in particular returns False from a
+worker thread even in the GUI — read it inside an `@idaread` helper, never directly.
+
+### Loading binaries headlessly
+
+`load_binary` spawns IDA with `-A` (autonomous: no dialogs, default answer to each).
+For PE/ELF/Mach-O pass only the path — the loader picks correctly and overriding is more
+likely to corrupt the load. For a raw blob the defaults (binary loader, `metapc`, base 0)
+are wrong and fail **silently**, so call `probe_binary` first.
+
+Gotchas, all verified on IDA 9.4 and all silent failures if ignored:
+- `-b` takes **paragraphs**, not bytes: `-b0x8000000` yields base `0x80000000`.
+  `get_imagebase()` reads 0 for binary loads — check the segment start instead.
+- ARM is the only module accepting `-p` options. Grammar is `<arch-or-core>[;<mod>...]`,
+  semicolon-separated; a bad token is **fatal**, so validate before spawning.
+  `armmeta` is documented but rejected by 9.4.
+- MCU device selection is `-DDEVICE=<leaf-name>`, not a `-p` option, and an unknown
+  device is **ignored silently**, producing a database with no memory map. IDA does not
+  record which device it used, so it cannot be verified afterwards — check the segment
+  map. Without an explicit device the module default is used (tc1766 for TriCore).
+- Loader options against an existing database make IDA `exit(1)` with no message; they
+  apply only at database creation. Use `fresh_db=True` or `idb_path`.
+- ARM/Thumb is the `T` segment register, set after load and **before** defining code.
+  Cortex-M variants (`-parm:ARMv7-M`) already default it to Thumb.
 
 ### API conventions
 - Prefer batch-first APIs.
