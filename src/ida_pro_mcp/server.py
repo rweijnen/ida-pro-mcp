@@ -230,6 +230,7 @@ def get_active_instance() -> dict:
 # ============================================================================
 
 from ida_pro_mcp.binfmt import probe_binary as _probe_binary
+from ida_pro_mcp.devices import check_device_applied as _check_device_applied
 from ida_pro_mcp.devices import list_devices as _list_devices
 from ida_pro_mcp.loader_args import LoaderArgError, build_loader_args
 from ida_pro_mcp.processors import PROCESSORS as _PROCESSOR_NAMES
@@ -321,6 +322,73 @@ def list_devices(processor: str) -> dict:
                      f"valid names."
         }
     return _list_devices(ida_dir, processor)
+
+
+def _read_instance_segments(inst: "IDAInstance") -> list[dict] | None:
+    """Fetch the segment list from an instance, or None if unavailable."""
+    conn = http.client.HTTPConnection(inst.host, inst.port, timeout=30)
+    try:
+        conn.request(
+            "POST",
+            "/mcp",
+            json.dumps({
+                "jsonrpc": "2.0",
+                "method": "resources/read",
+                "params": {"uri": "ida://idb/segments"},
+                "id": 1,
+            }),
+            {"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return None
+        contents = json.loads(resp.read().decode()).get("result", {}).get("contents", [])
+        if contents and "text" in contents[0]:
+            return json.loads(contents[0]["text"])
+        return None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+@mcp.tool
+def verify_device(processor: str, device: str) -> dict:
+    """Check that a device selection actually took effect in the active instance.
+
+    IDA ignores an unknown device SILENTLY, and does not record the device name
+    anywhere readable in the database -- so a typo produces a database with no
+    peripheral map and no error anywhere. This compares the loaded segments
+    against the memory areas the device's config declares, which is the only
+    reliable way to tell.
+
+    Call this after load_binary(device=...) on an MCU target. A False result
+    means the database is wrong and should be reloaded with a corrected device.
+
+    Args:
+        processor: The processor that was loaded, e.g. "tricore".
+        device: The device that was requested, e.g. "tc37x".
+    """
+    config = _read_ida_config()
+    ida_dir = config.get("ida_dir")
+    if not ida_dir:
+        return {"error": "IDA installation path not found."}
+
+    inst = instance_manager.get_active()
+    if inst is None:
+        return {"error": "No active IDA instance. Use list_instances/switch_instance."}
+
+    segments = _read_instance_segments(inst)
+    if segments is None:
+        return {"error": f"Could not read segments from instance on port {inst.port}."}
+
+    names = [s.get("name", "") for s in segments]
+    result = _check_device_applied(ida_dir, processor, device, names)
+    result["instance"] = {"port": inst.port, "binary": inst.binary_name}
+    result["segment_count"] = len(segments)
+    if result.get("applied") is False:
+        result["error"] = result["detail"]
+    return result
 
 
 @mcp.tool
@@ -527,6 +595,7 @@ _LOCAL_TOOLS = {
     "load_binary",
     "list_processors",
     "list_devices",
+    "verify_device",
     "probe_binary",
 }
 

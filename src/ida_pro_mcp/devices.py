@@ -95,6 +95,147 @@ def parse_device_cfg(path: str) -> dict:
     return {"devices": devices, "default": default, "groups": groups}
 
 
+def device_areas(cfg_path: str, device: str) -> list[str] | None:
+    """Return the memory-area names a device section declares.
+
+    Area lines look like:
+
+        area DATA CPU2_DSPR       0x50000000:0x50018000   CPU2 Data Scratch Pad SRAM
+
+    IDA turns each into a segment, so these names are exactly what should appear in the
+    database if the device actually applied.
+
+    Returns:
+        The area names; an empty list if the device exists but declares none (e.g.
+        TriCore's "generic" chipsets); or None if there is no such device section at
+        all. Matching is case-sensitive, as IDA's is.
+    """
+    areas: list[str] = []
+    in_section = False
+    found_section = False
+    try:
+        with open(cfg_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("."):
+                    body = line[1:].strip()
+                    if body.lower().startswith("default"):
+                        continue
+                    leaves = {
+                        e.strip().rsplit("/", 1)[-1]
+                        for e in body.split(",")
+                        if e.strip()
+                    }
+                    in_section = device in leaves
+                    found_section = found_section or in_section
+                    continue
+                if in_section and line.startswith("area "):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        areas.append(parts[2])
+    except OSError:
+        return None
+    return areas if found_section else None
+
+
+def check_device_applied(
+    ida_dir: str, processor: str, device: str, segment_names: list[str]
+) -> dict:
+    """Check whether a requested device actually took effect in a loaded database.
+
+    IDA silently ignores an unknown device, and the device name is not recorded
+    anywhere readable in the database (verified on 9.4: no netnode holds it, and
+    inf_get_procname() reports only the processor). So the only way to tell is to
+    compare the loaded segments against the areas the device's config section declares.
+
+    Returns a dict with "applied" (bool | None when undeterminable) and "detail".
+    """
+    if device.upper() == "NONE":
+        return {
+            "status": "applied",
+            "applied": True,
+            "detail": "DEVICE=NONE requested; no areas expected.",
+        }
+
+    cfg = os.path.join(ida_dir, "cfg", f"{cfg_name_for(processor)}.cfg")
+    if not os.path.isfile(cfg):
+        return {
+            "status": "undeterminable",
+            "applied": None,
+            "detail": f"No device config for {processor!r}; nothing to verify against.",
+        }
+
+    expected = device_areas(cfg, device)
+
+    if expected is None:
+        parsed = parse_device_cfg(cfg)
+        close = [d for d in parsed["devices"] if d.lower() == device.lower()]
+        hint = (
+            f" Did you mean {close[0]!r}? Device names are case-sensitive."
+            if close
+            else ""
+        )
+        return {
+            "status": "unknown_device",
+            "applied": False,
+            "detail": (
+                f"No device named {device!r} exists in "
+                f"{os.path.basename(cfg)}, so IDA cannot have applied it.{hint}"
+            ),
+        }
+
+    if not expected:
+        return {
+            "status": "undeterminable",
+            "applied": None,
+            "detail": (
+                f"Device {device!r} exists but declares no memory areas (generic "
+                f"chipsets do this), so its presence cannot be confirmed from the "
+                f"segment map."
+            ),
+        }
+
+    present = set(segment_names)
+    missing = [a for a in expected if a not in present]
+    found = len(expected) - len(missing)
+
+    if found == 0:
+        return {
+            "status": "not_applied",
+            "applied": False,
+            "expected_areas": len(expected),
+            "found_areas": 0,
+            "detail": (
+                f"Device {device!r} declares {len(expected)} memory areas but NONE are "
+                f"present in the database. IDA ignored the device. The database has no "
+                f"peripheral map and register names will be missing -- reload with a "
+                f"corrected device."
+            ),
+        }
+
+    if missing:
+        return {
+            "status": "mismatch",
+            "applied": False,
+            "expected_areas": len(expected),
+            "found_areas": found,
+            "missing": missing[:20],
+            "detail": (
+                f"Device mismatch: only {found}/{len(expected)} areas for {device!r} "
+                f"are present. A DIFFERENT device's map is loaded -- related chips "
+                f"share many area names, so a partial match means the database was "
+                f"built for another variant of this family."
+            ),
+        }
+
+    return {
+        "status": "applied",
+        "applied": True,
+        "expected_areas": len(expected),
+        "found_areas": found,
+        "detail": f"Device {device!r} applied: all {len(expected)} areas present.",
+    }
+
+
 def list_devices(ida_dir: str, processor: str) -> dict:
     """List selectable devices for a processor.
 
