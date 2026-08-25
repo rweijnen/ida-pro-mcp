@@ -39,8 +39,8 @@ dispatch_original = mcp.registry.dispatch
 class IDAInstance:
     """A discovered IDA Pro instance."""
 
-    __slots__ = ("host", "port", "binary_name", "binary_path", "base", "size",
-                 "processor", "bits", "analysis_complete")
+    __slots__ = ("host", "port", "binary_name", "binary_path", "input_path",
+                 "base", "size", "processor", "bits", "analysis_complete")
 
     def __init__(self, host: str, port: int, metadata: dict | None = None):
         self.host = host
@@ -48,6 +48,12 @@ class IDAInstance:
         md = metadata or {}
         self.binary_name: str = md.get("module", "")
         self.binary_path: str = md.get("path", "")
+        # The input file, as opposed to binary_path which is the .i64. Older
+        # plugin builds do not report it; fall back to stripping the database
+        # extension, which matches IDA's default APPEND_IDB_EXT=YES naming.
+        self.input_path: str = md.get("input_path", "") or os.path.splitext(
+            self.binary_path
+        )[0]
         self.base: str = md.get("base", "")
         self.size: str = md.get("size", "")
         self.processor: str = md.get("processor", "")
@@ -240,6 +246,16 @@ _IDA_MCP_CONFIG_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "config.json")
 _IDA_TOOLS_CACHE_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "tools_cache.json")
 
 
+def _unused_idb_path(binary_path: str) -> str:
+    """Pick a database path for an additional instance of an already-open binary."""
+    stem = f"{binary_path}.mcp"
+    for n in range(2, 100):
+        candidate = f"{stem}{n}.i64"
+        if not os.path.exists(candidate):
+            return candidate
+    return f"{stem}{os.getpid()}.i64"
+
+
 def _read_ida_config() -> dict:
     """Read shared config written by the IDA plugin."""
     try:
@@ -349,6 +365,8 @@ def load_binary(
     load_base: int | None = None,
     entry_point: int | None = None,
     device: str | None = None,
+    idb_path: str | None = None,
+    new_instance: bool = False,
     fresh_db: bool = False,
 ) -> dict:
     """Open a binary in a new IDA Pro instance. The MCP plugin auto-starts.
@@ -392,6 +410,14 @@ def load_binary(
             list_devices to find valid names. The name is checked against the
             processor's config before spawning, but see the note below: after
             loading, confirm the segment map yourself.
+        idb_path: Write the database here instead of alongside the input file.
+            Implies new_instance.
+        new_instance: Open a second copy of a binary that is already open in
+            another instance, using a separate database file. Without this,
+            loading an already-open binary is refused -- IDA locks the database
+            it has open, so the spawned process would die silently. Useful for
+            comparing two loads of the same image with different settings, e.g.
+            two candidate MCU devices side by side.
         fresh_db: Discard any existing .i64 and re-analyze from scratch.
             By default an existing database is reused (and opened without
             prompting).
@@ -430,6 +456,30 @@ def load_binary(
     # Record existing ports before spawning
     pre_spawn = [inst.port for inst in instance_manager.discover()]
 
+    # Refuse to open a binary another instance already holds. IDA locks the
+    # database it has open, so -c cannot delete it and the spawned process dies
+    # without ever publishing a port -- the caller just sees a timeout.
+    if idb_path is not None:
+        new_instance = True
+    if not new_instance:
+        target = os.path.normcase(os.path.abspath(binary_path))
+        for inst in instance_manager.discover():
+            existing = inst.input_path
+            if existing and os.path.normcase(os.path.abspath(existing)) == target:
+                return {
+                    "error": (
+                        f"{os.path.basename(binary_path)} is already open in the "
+                        f"instance on port {inst.port}. Use switch_instance("
+                        f"{inst.port}) to work with it. To open a second copy with "
+                        f"different loader settings, pass new_instance=True (each "
+                        f"instance needs its own database file)."
+                    ),
+                    "existing_port": inst.port,
+                }
+
+    if new_instance and idb_path is None:
+        idb_path = _unused_idb_path(binary_path)
+
     # Validate the device against the processor's config before spawning. IDA
     # ignores an unknown device SILENTLY, producing a database with no memory
     # map -- so an unchecked typo here is invisible rather than an error.
@@ -467,6 +517,7 @@ def load_binary(
             load_base=load_base,
             entry_point=entry_point,
             device=device,
+            idb_path=idb_path,
             fresh_db=fresh_db,
         )
     except LoaderArgError as e:
@@ -492,6 +543,8 @@ def load_binary(
         "loader_args": loader_args,
         "pre_existing_ports": pre_spawn,
     }
+    if idb_path is not None:
+        result["idb_path"] = idb_path
     if device is not None:
         result["verify"] = (
             f"IDA does not record which device it used, so device={device!r} cannot be "

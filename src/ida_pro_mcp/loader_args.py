@@ -30,6 +30,7 @@ def build_loader_args(
     load_base: int | None = None,
     entry_point: int | None = None,
     device: str | None = None,
+    idb_path: str | None = None,
     fresh_db: bool = False,
     extra: list[str] | None = None,
 ) -> list[str]:
@@ -46,6 +47,9 @@ def build_loader_args(
             LEAF name, not the group path ("tc37x", not "tc3xx/tc37x"). "NONE" selects
             no device. Callers should validate against list_devices first: IDA ignores
             an unknown device silently, producing a database with no memory map.
+        idb_path: Write the database here (-o) instead of alongside the input file.
+            Lets the same binary be opened more than once -- each instance needs its
+            own database file, since IDA locks the one it has open.
         fresh_db: Discard any existing database first (-c).
         extra: Raw arguments appended verbatim. Escape hatch; not validated.
 
@@ -100,6 +104,12 @@ def build_loader_args(
                 f"only -- use {device.rsplit('/', 1)[-1]!r}."
             )
         args.append(f"-DDEVICE={device}")
+
+    if idb_path is not None:
+        idb_path = idb_path.strip()
+        if not idb_path:
+            raise LoaderArgError("idb_path must be a non-empty string")
+        args.append(f"-o{idb_path}")
 
     if extra:
         args.extend(extra)

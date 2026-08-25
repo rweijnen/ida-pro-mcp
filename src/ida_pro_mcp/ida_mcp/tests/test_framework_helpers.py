@@ -49,6 +49,7 @@ def test_framework_assert_typed_dict():
     assert_typed_dict(
         {
             "path": "x",
+            "input_path": "/tmp/crackme03.elf",
             "module": "crackme03.elf",
             "base": "0x0",
             "size": "0x4068",
