@@ -336,8 +336,9 @@ With `--isolated-contexts`, strict Streamable HTTP session semantics are enabled
 ### Context tools
 
 - `idalib_open(input_path, ...)`: Open binary and bind it to the active context policy.
-  Note this does not yet accept the loader options (`processor`, `load_base`, `device`, …)
-  that `load_binary` supports, so raw/headerless images are best loaded through GUI IDA.
+  Accepts the same loader options as `load_binary` (`processor`, `file_type`, `load_base`,
+  `entry_point`, `device`, `fresh_db`) for raw/headerless images. Note `probe_binary`,
+  `list_processors` and `list_devices` live on the proxy server, not here.
 - `idalib_switch(session_id)`: Rebind the active context policy to an existing session.
 - `idalib_current()`: Return the session bound to the active context policy.
 - `idalib_unbind()`: Remove the active context binding.
