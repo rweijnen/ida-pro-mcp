@@ -73,6 +73,7 @@ class _AnalysisTracker(ida_idp.IDB_Hooks):
 
     def __init__(self):
         super().__init__()
+        self.installed_at: float = time.time()
         self.loaded_at: float | None = None
         self.completed_at: float | None = None
         self.completions: int = 0
@@ -114,6 +115,11 @@ def _is_gui() -> bool:
     analysis queue, so polling makes progress. Under idalib nothing drives it --
     auto_is_ok() stays false indefinitely until auto_wait() is called, which is
     what actually advances the queue.
+
+    MUST be called on the IDA main thread. is_idaq() returns False from a worker
+    thread even in the GUI, which would send a GUI instance down the headless
+    path and freeze the UI for the length of the analysis. Callers get this via
+    _auto_snapshot(), which is @idaread.
     """
     try:
         return bool(idaapi.is_idaq())
@@ -145,6 +151,8 @@ def _auto_snapshot() -> dict:
     snapshot = {
         "complete": bool(ida_auto.auto_is_ok()),
         "enabled": bool(ida_auto.is_auto_enabled()),
+        # Read here, on the main thread, where is_idaq() is meaningful.
+        "_gui": _is_gui(),
         "state": _AUTO_STATES.get(state, f"unknown({state})"),
         "queue": _AUTO_QUEUES.get(queue, f"unknown({queue})"),
         "queue_id": int(queue),
@@ -157,11 +165,23 @@ def _auto_snapshot() -> dict:
         if _tracker.completed_at is not None:
             snapshot["completed_at"] = _tracker.completed_at
             snapshot["completed_sec_ago"] = round(now - _tracker.completed_at, 1)
-        if _tracker.loaded_at is not None:
+
+        # loader_finished usually fires before the plugin is up, so fall back to
+        # when tracking started. Elapsed is then a lower bound, flagged as such
+        # rather than quietly reported as exact.
+        origin = _tracker.loaded_at or _tracker.installed_at
+        if origin is not None:
             reference = _tracker.completed_at or now
-            snapshot["analysis_elapsed_sec"] = round(reference - _tracker.loaded_at, 1)
+            snapshot["analysis_elapsed_sec"] = round(reference - origin, 1)
+            if _tracker.loaded_at is None:
+                snapshot["elapsed_is_lower_bound"] = True
 
     return snapshot
+
+
+def _public(snapshot: dict) -> dict:
+    """Strip internal keys before returning a snapshot to a caller."""
+    return {k: v for k, v in snapshot.items() if not k.startswith("_")}
 
 
 @tool
@@ -181,7 +201,7 @@ def analysis_status() -> dict:
     Results from other tools are incomplete while `complete` is false. For a
     short analysis, wait_for_analysis avoids checking repeatedly.
     """
-    return _auto_snapshot()
+    return _public(_auto_snapshot())
 
 
 @tool
@@ -218,13 +238,15 @@ def wait_for_analysis(
         return {"error": "timeout_sec must be positive"}
     poll_interval = min(max(poll_interval, 0.05), 5.0)
 
-    if not _is_gui():
-        started = time.monotonic()
-        _auto_wait_blocking()
+    started_headless = time.monotonic()
+    first = _auto_snapshot()
+    if not first["_gui"]:
+        if not first["complete"]:
+            _auto_wait_blocking()
         snapshot = _auto_snapshot()
         return {
-            **snapshot,
-            "waited_sec": round(time.monotonic() - started, 2),
+            **_public(snapshot),
+            "waited_sec": round(time.monotonic() - started_headless, 2),
             "timed_out": False,
             "mode": "headless-blocking",
             "note": (
@@ -242,11 +264,16 @@ def wait_for_analysis(
         elapsed = time.monotonic() - started
 
         if snapshot["complete"]:
-            return {**snapshot, "waited_sec": round(elapsed, 2), "timed_out": False}
+            return {
+                **_public(snapshot),
+                "waited_sec": round(elapsed, 2),
+                "timed_out": False,
+                "mode": "gui-polling",
+            }
 
         if cancel_event is not None and cancel_event.is_set():
             return {
-                **snapshot,
+                **_public(snapshot),
                 "waited_sec": round(elapsed, 2),
                 "timed_out": False,
                 "cancelled": True,
@@ -254,7 +281,7 @@ def wait_for_analysis(
 
         if time.monotonic() >= deadline:
             return {
-                **snapshot,
+                **_public(snapshot),
                 "waited_sec": round(elapsed, 2),
                 "timed_out": True,
                 "note": (
