@@ -40,7 +40,11 @@ from . import api_resources
 from .sync import idasync, idaread, IDAError, IDASyncError, CancelledError
 from .rpc import MCP_SERVER, MCP_UNSAFE, tool, unsafe, resource
 from .http import IdaMcpHttpRequestHandler
-from .api_core import init_caches
+from .api_core import init_caches, install_analysis_tracker
+
+# Record analysis lifecycle events from the moment the package loads, so
+# analysis_status can answer exactly rather than by sampling.
+install_analysis_tracker()
 
 __all__ = [
     # Infrastructure modules
@@ -71,4 +75,5 @@ __all__ = [
     "resource",
     "IdaMcpHttpRequestHandler",
     "init_caches",
+    "install_analysis_tracker",
 ]

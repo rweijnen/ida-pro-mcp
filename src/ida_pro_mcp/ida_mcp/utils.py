@@ -254,6 +254,7 @@ class UndefineOp(TypedDict, total=False):
 
 class Metadata(TypedDict):
     path: str
+    input_path: str
     module: str
     base: str
     size: str

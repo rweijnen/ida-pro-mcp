@@ -9,9 +9,15 @@ from typing import Annotated, Optional
 # idapro must go first to initialize idalib
 import idapro
 
+from ida_pro_mcp.devices import list_devices
 from ida_pro_mcp.ida_mcp import MCP_SERVER
 from ida_pro_mcp.ida_mcp.rpc import get_current_transport_session_id, tool
 from ida_pro_mcp.idalib_session_manager import get_session_manager
+from ida_pro_mcp.loader_args import (
+    LoaderArgError,
+    build_loader_args,
+    existing_database,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +33,39 @@ IDALIB_MANAGEMENT_TOOLS = {
 }
 
 _ISOLATED_CONTEXTS_ENABLED = False
+
+
+def _validated_device(processor: Optional[str], device: Optional[str]) -> Optional[str]:
+    """Check a device name against the processor's config before it reaches IDA.
+
+    IDA ignores an unknown device silently, producing a database with no memory map,
+    and does not record which device it used -- so an unchecked typo is invisible.
+    """
+    if device is None or device.upper() == "NONE":
+        return device
+    if processor is None:
+        raise LoaderArgError(
+            "device requires processor to be specified as well, since device names "
+            "are per-processor."
+        )
+
+    base_proc = processor.split(":", 1)[0]
+    known = list_devices(idapro.get_ida_install_dir(), base_proc)
+    if known.get("devices") and device not in known["devices"]:
+        leaf = device.rsplit("/", 1)[-1]
+        if "/" in device and leaf in known["devices"]:
+            raise LoaderArgError(
+                f"device {device!r} is a group path. IDA matches the leaf name only "
+                f"-- use {leaf!r}."
+            )
+        close = [d for d in known["devices"] if d.lower() == device.lower()]
+        hint = (
+            f" Did you mean {close[0]!r}? Device names are case-sensitive."
+            if close
+            else f" Valid devices: {', '.join(known['devices'][:40])}"
+        )
+        raise LoaderArgError(f"Unknown device {device!r} for {base_proc!r}.{hint}")
+    return device
 
 
 def _resolve_effective_context_id() -> str:
@@ -108,20 +147,82 @@ def idalib_open(
     session_id: Annotated[
         Optional[str], "Custom session ID (auto-generated if not provided)"
     ] = None,
+    processor: Annotated[
+        Optional[str],
+        "IDA processor name, e.g. 'tricore', 'mipsb', or 'arm:ARMv7-A;NEON'",
+    ] = None,
+    file_type: Annotated[
+        Optional[str], "Loader/format prefix, e.g. 'binary' for a headerless blob"
+    ] = None,
+    load_base: Annotated[
+        Optional[int], "Byte address to load at (must be 16-byte aligned)"
+    ] = None,
+    entry_point: Annotated[Optional[int], "Initial entry point address"] = None,
+    device: Annotated[
+        Optional[str], "MCU device / chip variant, e.g. 'tc37x'"
+    ] = None,
+    fresh_db: Annotated[
+        bool, "Discard any existing database and re-analyze from scratch"
+    ] = False,
 ) -> dict:
-    """Open a binary and bind it to the active idalib context policy."""
+    """Open a binary and bind it to the active idalib context policy.
+
+    For recognized formats (PE/ELF/Mach-O) pass only input_path -- the loader
+    selects the processor and base correctly.
+
+    For a raw/headerless blob the defaults (binary loader, metapc, base 0) are
+    almost certainly wrong and fail SILENTLY, so pass file_type="binary" plus
+    the correct processor and load_base. Use list_processors and list_devices
+    (on the proxy server) or IDA's documentation to find the names.
+
+    Loader options apply only when the database is created. If a database
+    already exists they are ignored, so pass fresh_db=True to rebuild.
+    """
+
+    try:
+        loader_args = build_loader_args(
+            processor=processor,
+            file_type=file_type,
+            load_base=load_base,
+            entry_point=entry_point,
+            device=_validated_device(processor, device),
+            fresh_db=fresh_db,
+        )
+    except LoaderArgError as e:
+        return {"error": str(e)}
+
+    # Loader options only apply when a database is created. Passing them to an
+    # existing one raises a FATAL error inside idalib that terminates this whole
+    # process, taking every other session with it -- so never let it reach IDA.
+    if loader_args and not fresh_db:
+        existing = existing_database(str(input_path))
+        if existing:
+            return {
+                "error": (
+                    f"Loader options were given, but a database already exists "
+                    f"({Path(existing).name}). IDA applies these only when creating a "
+                    f"database, and rejects them fatally otherwise. Pass fresh_db=True "
+                    f"to discard it and re-analyze, or drop the loader options to open "
+                    f"the existing database as-is."
+                ),
+                "existing_database": existing,
+            }
 
     try:
         manager = get_session_manager()
         context_id = _resolve_effective_context_id()
         opened_session_id = manager.open_binary(
-            Path(input_path), run_auto_analysis=run_auto_analysis, session_id=session_id
+            Path(input_path),
+            run_auto_analysis=run_auto_analysis,
+            session_id=session_id,
+            loader_args=loader_args,
         )
         session = manager.bind_context(context_id, opened_session_id, activate=True)
         return {
             "success": True,
             **_context_response_fields(context_id),
             "session": session.to_dict(),
+            "loader_args": loader_args,
             "message": (
                 f"Binary opened and bound to context: {session.input_path.name} "
                 f"({opened_session_id})"

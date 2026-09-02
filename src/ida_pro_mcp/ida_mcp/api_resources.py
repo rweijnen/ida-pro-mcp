@@ -58,6 +58,7 @@ def idb_metadata_resource() -> Metadata:
 
     result = Metadata(
         path=path,
+        input_path=input_path,
         module=module,
         base=base,
         size=size,

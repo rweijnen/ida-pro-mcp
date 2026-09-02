@@ -16,6 +16,9 @@ from ..api_modify import (
     define_func,
     define_code,
     undefine,
+    get_thumb,
+    set_thumb,
+    set_default_thumb,
 )
 from ..api_memory import get_bytes, patch
 from ..api_core import lookup_funcs
@@ -379,3 +382,82 @@ def test_undefine_batch():
         if idaapi.get_func(start_ea) is None:
             define_code({"addr": hex(start_ea)})
             define_func({"addr": hex(start_ea), "end": hex(end_ea)})
+
+
+# ---------------------------------------------------------------------------
+# ARM Thumb mode (T segment register)
+# ---------------------------------------------------------------------------
+
+
+def _thumb_supported() -> bool:
+    import ida_idp
+
+    return ida_idp.str2reg("T") != -1
+
+
+@test()
+def test_modify_thumb_rejects_non_arm():
+    """Thumb tools fail clearly on processors without a T register."""
+    if _thumb_supported():
+        skip_test("ARM database: the non-ARM guard does not apply")
+
+    from ..sync import IDAError
+
+    for call in (
+        lambda: get_thumb("0x0"),
+        lambda: set_thumb("0x0", thumb=True),
+        lambda: set_default_thumb("0x0", thumb=True),
+    ):
+        try:
+            call()
+        except IDAError as e:
+            # The message must name the actual problem, not just fail.
+            assert "T register" in str(e), f"unhelpful error: {e}"
+        else:
+            raise AssertionError("expected IDAError on a non-ARM database")
+
+
+@test()
+def test_modify_thumb_round_trip():
+    """set_thumb flips T and get_thumb reads it back, bounded by `end`."""
+    if not _thumb_supported():
+        skip_test("not an ARM database (no T register)")
+
+    addr = get_any_function()
+    if addr is None:
+        skip_test("binary has no functions")
+    ea = int(addr, 16)
+
+    original = get_thumb(addr)[0]
+    assert original["thumb"] in (True, False), original
+
+    flipped = not original["thumb"]
+    result = set_thumb(addr, thumb=flipped)
+    assert_ok(result)
+    assert result["was_thumb"] == original["thumb"], result
+    assert get_thumb(addr)[0]["thumb"] is flipped
+
+    # Restore, bounding the range so the rest of the segment is untouched.
+    restored = set_thumb(addr, thumb=original["thumb"], end=hex(ea + 8))
+    assert_ok(restored)
+    assert get_thumb(addr)[0]["thumb"] is original["thumb"]
+
+
+@test()
+def test_modify_thumb_rejects_bad_range():
+    """set_thumb rejects an end address at or below start."""
+    if not _thumb_supported():
+        skip_test("not an ARM database (no T register)")
+
+    from ..sync import IDAError
+
+    addr = get_any_function()
+    if addr is None:
+        skip_test("binary has no functions")
+    ea = int(addr, 16)
+    try:
+        set_thumb(hex(ea + 0x10), thumb=True, end=hex(ea))
+    except IDAError as e:
+        assert "must be above" in str(e), f"unhelpful error: {e}"
+    else:
+        raise AssertionError("expected IDAError for an inverted range")

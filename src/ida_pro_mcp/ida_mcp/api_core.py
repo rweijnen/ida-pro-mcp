@@ -6,10 +6,13 @@ from typing import Annotated
 
 import idaapi
 import idautils
+import ida_auto
+import ida_idp
 import ida_nalt
 
 from .rpc import tool
 from .sync import idaread, idasync
+from .zeromcp.jsonrpc import get_current_cancel_event
 
 # Cached strings list: [(ea, text), ...]
 _strings_cache: list[tuple[int, str]] | None = None
@@ -27,6 +30,269 @@ def invalidate_strings_cache():
     """Clear the strings cache (call after IDB changes)."""
     global _strings_cache
     _strings_cache = None
+
+
+# ============================================================================
+# Auto-analysis progress
+# ============================================================================
+
+_AUTO_STATES = {
+    ida_auto.st_Ready: "ready",
+    ida_auto.st_Think: "thinking",
+    ida_auto.st_Waiting: "waiting",
+    ida_auto.st_Work: "working",
+}
+
+# Queue types, in roughly the order auto-analysis works through them. AU_FINAL is
+# the last pass, so reaching it means analysis is nearly done.
+_AUTO_QUEUES = {
+    ida_auto.AU_NONE: "none",
+    ida_auto.AU_UNK: "make-unknown",
+    ida_auto.AU_CODE: "make-code",
+    ida_auto.AU_WEAK: "weak-code",
+    ida_auto.AU_PROC: "make-procedure",
+    ida_auto.AU_TAIL: "function-tails",
+    ida_auto.AU_FCHUNK: "function-chunks",
+    ida_auto.AU_USED: "reanalyze-operands",
+    ida_auto.AU_TYPE: "apply-types",
+    ida_auto.AU_LIBF: "flirt-signatures",
+    ida_auto.AU_LBF2: "flirt-signatures-2",
+    ida_auto.AU_LBF3: "flirt-signatures-3",
+    ida_auto.AU_CHLB: "load-signatures",
+    ida_auto.AU_FINAL: "final-pass",
+}
+
+
+class _AnalysisTracker(ida_idp.IDB_Hooks):
+    """Records analysis lifecycle events as they happen.
+
+    Polling can only report the state at sample time; these events give the exact
+    moment analysis finished even when nobody was watching. That is what makes
+    analysis_status cheap enough to check casually instead of blocking on a wait.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.installed_at: float = time.time()
+        self.loaded_at: float | None = None
+        self.completed_at: float | None = None
+        self.completions: int = 0
+
+    def loader_finished(self, *args):
+        self.loaded_at = time.time()
+        self.completed_at = None
+        return 0
+
+    def auto_empty_finally(self, *args):
+        self.completed_at = time.time()
+        self.completions += 1
+        return 0
+
+
+_tracker: _AnalysisTracker | None = None
+
+
+def install_analysis_tracker() -> bool:
+    """Install the analysis lifecycle hook. Idempotent."""
+    global _tracker
+    if _tracker is not None:
+        return True
+    try:
+        tracker = _AnalysisTracker()
+        if not tracker.hook():
+            return False
+        _tracker = tracker
+        return True
+    except Exception as e:  # hooks are best-effort; status still works without them
+        print(f"[MCP] Could not install analysis tracker: {e}")
+        return False
+
+
+def _is_gui() -> bool:
+    """True in GUI IDA, false under idalib/headless.
+
+    The distinction matters for waiting: in the GUI the UI thread drives the
+    analysis queue, so polling makes progress. Under idalib nothing drives it --
+    auto_is_ok() stays false indefinitely until auto_wait() is called, which is
+    what actually advances the queue.
+
+    MUST be called on the IDA main thread. is_idaq() returns False from a worker
+    thread even in the GUI, which would send a GUI instance down the headless
+    path and freeze the UI for the length of the analysis. Callers get this via
+    _auto_snapshot(), which is @idaread.
+    """
+    try:
+        return bool(idaapi.is_idaq())
+    except Exception:
+        return False
+
+
+@idasync
+def _auto_wait_blocking() -> None:
+    """Drive the analysis queue to completion (headless only).
+
+    Safe under idalib, which is single-threaded anyway. Never use this in the
+    GUI: it would occupy the main thread for the whole analysis, freezing the UI
+    and stalling every other request behind the lock.
+    """
+    ida_auto.auto_wait()
+
+
+@idaread
+def _auto_snapshot() -> dict:
+    """Read auto-analysis state. Runs briefly on the IDA main thread."""
+    display = ida_auto.auto_display_t()
+    have_display = ida_auto.get_auto_display(display)
+
+    ea = display.ea if have_display else idaapi.BADADDR
+    queue = display.type if have_display else ida_auto.AU_NONE
+    state = display.state if have_display else ida_auto.st_Ready
+
+    snapshot = {
+        "complete": bool(ida_auto.auto_is_ok()),
+        "enabled": bool(ida_auto.is_auto_enabled()),
+        # Read here, on the main thread, where is_idaq() is meaningful.
+        "_gui": _is_gui(),
+        "state": _AUTO_STATES.get(state, f"unknown({state})"),
+        "queue": _AUTO_QUEUES.get(queue, f"unknown({queue})"),
+        "queue_id": int(queue),
+        "current_ea": None if ea == idaapi.BADADDR else hex(ea),
+        "final_pass": queue == ida_auto.AU_FINAL,
+    }
+
+    if _tracker is not None:
+        now = time.time()
+        if _tracker.completed_at is not None:
+            snapshot["completed_at"] = _tracker.completed_at
+            snapshot["completed_sec_ago"] = round(now - _tracker.completed_at, 1)
+
+        # loader_finished usually fires before the plugin is up, so fall back to
+        # when tracking started. Elapsed is then a lower bound, flagged as such
+        # rather than quietly reported as exact.
+        origin = _tracker.loaded_at or _tracker.installed_at
+        if origin is not None:
+            reference = _tracker.completed_at or now
+            snapshot["analysis_elapsed_sec"] = round(reference - origin, 1)
+            if _tracker.loaded_at is None:
+                snapshot["elapsed_is_lower_bound"] = True
+
+    return snapshot
+
+
+def _public(snapshot: dict) -> dict:
+    """Strip internal keys before returning a snapshot to a caller."""
+    return {k: v for k, v in snapshot.items() if not k.startswith("_")}
+
+
+@tool
+def analysis_status() -> dict:
+    """Report whether IDA's auto-analysis is still running, and what it is doing.
+
+    This is cheap -- completion is recorded by an event hook, not measured by
+    polling -- so it is fine to check whenever you want to know where things
+    stand. It is the right tool for a long analysis: rather than waiting, do
+    other work and check back.
+
+    Returns `complete` (the thing you usually want), plus the current queue, the
+    address being worked on, and `analysis_elapsed_sec`. A `current_ea` that
+    keeps moving between calls means progress; one that is stuck does not.
+    `final_pass` is true during the last queue, so analysis is nearly done.
+
+    Results from other tools are incomplete while `complete` is false. For a
+    short analysis, wait_for_analysis avoids checking repeatedly.
+    """
+    return _public(_auto_snapshot())
+
+
+@tool
+def wait_for_analysis(
+    timeout_sec: Annotated[float, "Give up after this long (seconds)"] = 120.0,
+    poll_interval: Annotated[float, "Seconds between checks"] = 0.5,
+) -> dict:
+    """Wait, up to timeout_sec, for IDA's auto-analysis to finish.
+
+    Convenience for the common case where analysis takes seconds to a couple of
+    minutes: one call instead of checking repeatedly. Call it after loading a
+    binary, and after operations that queue more work (define_func, patch,
+    undefine, or a rebase).
+
+    DO NOT use this to sit out a long analysis. Large or complex binaries can
+    take a very long time, and nothing useful happens while you wait. If this
+    returns timed_out=true, switch to checking analysis_status between other
+    work rather than calling this again in a loop -- completion is recorded by
+    an event hook, so that check is cheap and exact.
+
+    Returns the final analysis_status plus how long the wait took. A timeout
+    returns timed_out=true rather than raising, with the partial state still
+    visible; analysis is not affected either way and keeps running.
+
+    In GUI IDA this does NOT hold the main thread: it samples the analysis state
+    briefly and sleeps in between, so other requests and the UI stay responsive
+    while it waits.
+
+    Headless (idalib) works differently. Nothing drives the analysis queue there,
+    so polling would never finish; the wait instead runs to completion in one
+    call and timeout_sec does not apply.
+    """
+    if timeout_sec <= 0:
+        return {"error": "timeout_sec must be positive"}
+    poll_interval = min(max(poll_interval, 0.05), 5.0)
+
+    started_headless = time.monotonic()
+    first = _auto_snapshot()
+    if not first["_gui"]:
+        if not first["complete"]:
+            _auto_wait_blocking()
+        snapshot = _auto_snapshot()
+        return {
+            **_public(snapshot),
+            "waited_sec": round(time.monotonic() - started_headless, 2),
+            "timed_out": False,
+            "mode": "headless-blocking",
+            "note": (
+                "Headless: analysis was driven to completion with auto_wait(); "
+                "timeout_sec does not apply in this mode."
+            ),
+        }
+
+    cancel_event = get_current_cancel_event()
+    started = time.monotonic()
+    deadline = started + timeout_sec
+
+    while True:
+        snapshot = _auto_snapshot()
+        elapsed = time.monotonic() - started
+
+        if snapshot["complete"]:
+            return {
+                **_public(snapshot),
+                "waited_sec": round(elapsed, 2),
+                "timed_out": False,
+                "mode": "gui-polling",
+            }
+
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                **_public(snapshot),
+                "waited_sec": round(elapsed, 2),
+                "timed_out": False,
+                "cancelled": True,
+            }
+
+        if time.monotonic() >= deadline:
+            return {
+                **_public(snapshot),
+                "waited_sec": round(elapsed, 2),
+                "timed_out": True,
+                "note": (
+                    f"Analysis still running after {timeout_sec:g}s and may take much "
+                    f"longer. Do not keep waiting -- get on with other work and call "
+                    f"analysis_status when you need to know, which is cheap. Tool "
+                    f"results are incomplete until it reports complete."
+                ),
+            }
+
+        time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
 
 
 # Cached function list: [Function(...), ...]

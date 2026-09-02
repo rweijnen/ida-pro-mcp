@@ -3,7 +3,12 @@
 Fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) with additional features:
 
 - **Auto-start plugin** — MCP server starts automatically when IDA opens (no Ctrl+Alt+M needed)
-- **`load_binary` tool** — AI clients can spawn new IDA instances directly
+- **`load_binary` tool** — AI clients can spawn new IDA instances directly, without dialogs
+- **Raw binary loading** — specify processor, image base, file type and MCU device, so firmware
+  dumps and headerless blobs can be loaded headlessly (`probe_binary`, `list_processors`, `list_devices`)
+- **ARM Thumb control** — `get_thumb` / `set_thumb` / `set_default_thumb` for Cortex-M firmware
+- **Analysis progress** — `analysis_status` / `wait_for_analysis` report whether auto-analysis
+  is done, which queue it is in, and where it is working
 - **Multi-instance improvements** — more reliable discovery with increased probe timeout
 - **Large response pagination** — `decompile`, `get_bytes`, and `xrefs_to_field` support `max_lines`/`offset` for incremental reading
 - **Read/write lock splitting** — read-only tools use `MFF_READ` (shared lock) instead of `MFF_WRITE`, reducing contention under concurrent access
@@ -63,6 +68,12 @@ Configure the MCP servers and install the IDA Plugin:
 ```
 ida-pro-mcp --install
 ```
+
+This installs with the **stdio** transport, which runs `server.py` as a subprocess so the
+proxy layer is active. The proxy is what provides `load_binary`, `list_instances`,
+`switch_instance`, `probe_binary`, `list_processors` and `list_devices` — a direct HTTP
+connection to the IDA plugin does not have them. Only override with `--transport` if you
+specifically want that direct connection.
 
 **Important**: Make sure you completely restart IDA and your MCP client for the installation to take effect. Some clients (like Claude) run in the background and need to be quit from the tray icon.
 
@@ -153,24 +164,91 @@ The MCP server supports multiple IDA instances running simultaneously. Each IDA 
 | `list_instances` | Discover and list all running IDA instances (binary name, port, processor, analysis status) |
 | `switch_instance` | Switch active instance by port number or binary name substring |
 | `get_active_instance` | Get info about the currently active instance |
-| `load_binary` | Spawn a new IDA Pro instance with a binary (returns immediately, non-blocking) |
+| `load_binary` | Spawn a new IDA Pro instance with a binary, wait for it to come up, and make it active |
 
 **Workflow:**
 
 1. Open multiple binaries in separate IDA instances — the MCP plugin auto-starts in each
 2. Or use `load_binary("/path/to/binary")` from the AI client to spawn a new IDA instance
-3. Poll `list_instances` until the new instance appears (check for ports not in `pre_existing_ports` from the `load_binary` response)
-4. Use `switch_instance(name="firmware")` or `switch_instance(port=13338)` to activate it
+3. Use `switch_instance(name="firmware")` or `switch_instance(port=13338)` to change the active one
 
 **`load_binary` details:**
 
-The `load_binary` tool spawns IDA and returns immediately with the PID and a list of pre-existing ports. It reads the IDA installation path from `~/.ida_mcp/config.json` (written automatically by the plugin on first load). The AI client should poll `list_instances` in a background task until a new port appears, then `switch_instance` to it. This typically takes 10-60s but can be longer for large binaries with extensive auto-analysis.
+`load_binary` spawns IDA with `-A` (autonomous mode: no dialogs, default answer to each),
+waits for the new instance to publish its port, makes it active, and returns
+`status: "ready"` with the port, processor, bit width and analysis state. No polling is
+needed. It reads the IDA installation path from `~/.ida_mcp/config.json`, written
+automatically by the plugin on first load.
 
-**Tip for Claude Code users:** Call `list_instances` once in the foreground before using `load_binary`. This establishes the MCP tool permission so that background polling agents can call `list_instances` without being blocked by permission prompts.
+Startup typically takes 10-60s. Pass `wait=false` to return immediately instead, or raise
+`wait_timeout` (default 180s) for very large binaries. Note the wait covers IDA *starting*,
+not auto-analysis — see [Analysis Progress](#analysis-progress).
+
+If the binary is already open in another instance, `load_binary` refuses and names the port
+holding it, since IDA locks its database. Pass `new_instance=true` to open a second copy
+with its own database file, which is useful for comparing two loads of the same image with
+different settings.
 
 When multiple instances are active, tool responses are tagged with `[instance: <binary> @ port <N>]` so the AI can verify it is querying the correct binary. The MCP server also injects instructions into the initialize response to guide AI clients on multi-instance workflow and effective use of IDA tools.
 
 **Windows port safety:** On Windows, `SO_EXCLUSIVEADDRUSE` prevents multiple IDA instances from silently sharing the same port (a common `SO_REUSEADDR` pitfall on Windows).
+
+## Loading Raw Binaries and Firmware
+
+For PE, ELF and Mach-O, pass only the path — IDA's loader picks the processor and base
+correctly, and overriding is more likely to corrupt the load than improve it.
+
+Headerless images (firmware dumps, ROM images, shellcode) have nothing for IDA to detect,
+so under `-A` it silently falls back to the binary loader, `metapc` and base 0 — producing
+a confidently wrong database rather than an error. For those, supply the details:
+
+```python
+probe_binary("/path/to/firmware.bin")
+# -> {"format": "unknown", "recognized": false,
+#     "advice": "Headerless/unrecognized ... pass file_type='binary' plus ..."}
+
+list_processors(family="TriCore")     # find the processor name
+list_devices("tricore")               # find the MCU device
+
+load_binary("/path/to/firmware.bin",
+            processor="tricore", file_type="binary",
+            load_base=0x80000000, device="tc37x")
+```
+
+| Tool | Description |
+|------|-------------|
+| `probe_binary` | Detect a file's format before loading, and whether loader options are needed |
+| `list_processors` | Processor names for `processor=`, optionally filtered by family |
+| `list_devices` | MCU device (chip variant) names for `device=`, per processor |
+
+All three run in the MCP server itself, so they work with no IDA instance running — which
+is when you need them, before deciding how to load.
+
+**`load_binary` loader options**
+
+| Option | Purpose |
+|--------|---------|
+| `processor` | Processor name, e.g. `tricore`, `mipsb`. ARM accepts options: `arm:ARMv7-A;NEON` |
+| `file_type` | Loader/format prefix, e.g. `binary` for a headerless blob |
+| `load_base` | Byte address to load at (must be 16-byte aligned) |
+| `entry_point` | Initial entry point address |
+| `device` | MCU device / chip variant, e.g. `tc37x` |
+| `fresh_db` | Discard an existing database and re-analyze |
+| `idb_path` | Write the database somewhere other than next to the input |
+
+Things worth knowing, all of which fail quietly in IDA itself:
+
+- **Loader options only apply when a database is created.** If one already exists, IDA
+  exits without a message. `load_binary` checks first and tells you to use `fresh_db=true`.
+- **An unknown MCU device is ignored silently**, giving a database with no memory map. The
+  name is validated against IDA's config before spawning, but IDA does not record which
+  device it used, so it cannot be confirmed afterwards — check the segment map looks like
+  the chip you expect. Without an explicit device the module default is used, which for
+  TriCore is a TC1766.
+- **Processor names are case-sensitive** and are not the module filenames in IDA's `procs/`
+  directory (x86's module is `pc`, but the name is `metapc`).
+- **An invalid ARM `-p` option is fatal** to IDA, so `processor` is validated before the
+  spawn.
 
 ## Large Response Pagination
 
@@ -188,10 +266,16 @@ Some tools produce large outputs that can overwhelm LLM context windows. The fol
 
 By default, all IDA SDK calls run on the main thread via `execute_sync()`. This fork splits tools into two lock modes:
 
-- **`@idaread`** (MFF_READ, shared lock) — used by 48 read-only tools (decompile, disasm, xrefs, get_bytes, etc.). Multiple read operations can execute concurrently.
-- **`@idasync`** (MFF_WRITE, exclusive lock) — used by 25 mutating tools (rename, patch, set_type, etc.). These still acquire an exclusive lock.
+- **`@idaread`** (MFF_READ, shared lock) — used by 37 read-only tools (xrefs, get_bytes, list_funcs, etc.). Multiple read operations can execute concurrently.
+- **`@idasync`** (MFF_WRITE, exclusive lock) — used by 27 mutating tools (rename, patch, set_type, etc.). These still acquire an exclusive lock.
 
 This reduces contention when multiple AI clients query the same IDA instance simultaneously. Read-only operations no longer block each other.
+
+A handful of tools carry neither decorator, because they either need no IDA access
+(`int_convert`), manage locking internally (`decompile`, `disasm`), or deliberately avoid
+holding the lock while they wait (`analysis_status`, `wait_for_analysis`). Any new `@tool`
+that touches the IDA SDK needs one of the two decorators: without it the call runs on the
+HTTP handler thread, where SDK functions return wrong answers rather than failing.
 
 ## VTableExplorer Integration
 
@@ -252,6 +336,9 @@ With `--isolated-contexts`, strict Streamable HTTP session semantics are enabled
 ### Context tools
 
 - `idalib_open(input_path, ...)`: Open binary and bind it to the active context policy.
+  Accepts the same loader options as `load_binary` (`processor`, `file_type`, `load_base`,
+  `entry_point`, `device`, `fresh_db`) for raw/headerless images. Note `probe_binary`,
+  `list_processors` and `list_devices` live on the proxy server, not here.
 - `idalib_switch(session_id)`: Rebind the active context policy to an existing session.
 - `idalib_current()`: Return the session bound to the active context policy.
 - `idalib_unbind()`: Remove the active context binding.
@@ -263,7 +350,7 @@ With `--isolated-contexts`, strict Streamable HTTP session semantics are enabled
 **Resources** represent browsable state (read-only data) following MCP's philosophy.
 
 **Core IDB State:**
-- `ida://idb/metadata` - IDB file info (path, arch, base, size, hashes, processor, bits, analysis status)
+- `ida://idb/metadata` - IDB file info (database path, input file path, arch, base, size, hashes, processor, bits, analysis status)
 - `ida://idb/segments` - Memory segments with permissions
 - `ida://idb/entrypoints` - Entry points (main, TLS callbacks, etc.)
 
@@ -302,6 +389,36 @@ With `--isolated-contexts`, strict Streamable HTTP session semantics are enabled
 - `define_func(items)`: Define function(s) at address(es). Optionally specify `end` for explicit bounds.
 - `define_code(items)`: Convert bytes to code instruction(s) at address(es).
 - `undefine(items)`: Undefine item(s) at address(es), converting back to raw bytes. Optionally specify `end` or `size`.
+- `refresh_caches()`: Force-refresh the strings/functions/globals caches after bulk changes.
+
+## ARM Thumb Mode
+
+ARM/Thumb is not a load option — IDA models it as a virtual segment register `T`
+(0 = ARM, non-zero = Thumb). Getting it wrong is silent: the same bytes decode as
+`PUSH {R7,LR}; MOV R7,SP` with Thumb and as `STRBTMI R11,[PC],-R0,LSL#11` with ARM.
+
+- `get_thumb(addrs)`: Read the mode at address(es), with the covering range.
+- `set_thumb(start, thumb, end=None)`: Set the mode over a range. Undefines code in the
+  range by default, since changing `T` does not re-decode existing instructions.
+- `set_default_thumb(addr, thumb)`: Set a segment's default mode, for uniformly-Thumb images.
+
+**Set the mode before defining code.** Cortex-M variants (`processor="arm:ARMv7-M"`)
+already default to Thumb, so these are for images that guess wrong or are mixed.
+
+## Analysis Progress
+
+Auto-analysis keeps running after a binary loads, and results from other tools are
+incomplete until it finishes.
+
+- `analysis_status()`: Whether analysis is complete, which queue it is in, the address
+  being worked on, and elapsed time. Completion is recorded by an event hook rather than
+  measured by polling, so this is cheap to call.
+- `wait_for_analysis(timeout_sec=120)`: Wait for analysis to finish. Returns
+  `timed_out: true` with partial state rather than raising.
+
+For a long analysis, prefer `analysis_status` between other work over sitting in
+`wait_for_analysis` — a `current_ea` that keeps moving means progress, one that is stuck
+does not.
 
 ## Memory Reading Operations
 
@@ -360,13 +477,11 @@ http://127.0.0.1:13337/mcp?ext=dbg
 ## Advanced Analysis Operations
 
 - `py_eval(code)`: Execute arbitrary Python code in IDA context (returns dict with result/stdout/stderr, supports Jupyter-style evaluation).
-- `analyze_funcs(addrs)`: Comprehensive function analysis (decompilation, assembly, xrefs, callees, callers, strings, constants, basic blocks).
 
 ## Pattern Matching & Search
 
 - `find_regex(queries)`: Search strings with case-insensitive regex (paginated).
 - `find_bytes(patterns, limit=1000, offset=0)`: Find byte pattern(s) in binary (e.g., "48 8B ?? ??"). Max limit: 10000.
-- `find_insns(sequences, limit=1000, offset=0)`: Find instruction sequence(s) in code. Max limit: 10000.
 - `find(type, targets, limit=1000, offset=0)`: Advanced search (immediate values, strings, data/code references). Max limit: 10000.
 
 ## Control Flow Analysis

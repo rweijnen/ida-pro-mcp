@@ -1,8 +1,12 @@
+from typing import Annotated
+
 import idaapi
 import idautils
 import idc
 import ida_hexrays
 import ida_bytes
+import ida_idp
+import ida_segregs
 import ida_typeinf
 import ida_frame
 import ida_dirtree
@@ -10,7 +14,8 @@ import ida_funcs
 import ida_ua
 
 from .rpc import tool
-from .sync import idasync, IDAError
+from .sync import idasync, idaread, IDAError
+from . import compat
 from .api_core import invalidate_funcs_cache, invalidate_globals_cache
 from .utils import (
     parse_address,
@@ -25,6 +30,7 @@ from .utils import (
     RenameBatch,
     DefineOp,
     UndefineOp,
+    normalize_list_input,
 )
 
 
@@ -542,3 +548,196 @@ def undefine(items: list[UndefineOp] | UndefineOp) -> list[dict]:
             results.append({"addr": addr_str, "error": str(e)})
 
     return results
+
+
+# ============================================================================
+# ARM Thumb mode (T segment register)
+# ============================================================================
+#
+# ARM/Thumb is not a load-time option: IDA models it as a virtual segment
+# register named T (0 = ARM, non-zero = Thumb). Getting it wrong does not
+# produce an error, it produces plausible-looking garbage -- the same bytes
+# decode as `PUSH {R7,LR}; MOV R7,SP` with T=1 and as
+# `STRBTMI R11,[PC],-R0,LSL#11` with T=0.
+#
+# This matters most for raw firmware dumps, where nothing tells IDA the mode.
+# Cortex-M parts are Thumb-only, so `-parm:ARMv7-M` (or a Cortex-M core name)
+# already defaults T to 1; these tools are for the cases that guess wrong.
+
+
+def _thumb_reg() -> int:
+    """Return the T register number, or raise if this is not an ARM database."""
+    reg = ida_idp.str2reg("T")
+    if reg == -1:
+        raise IDAError(
+            "This database has no T register: Thumb mode is ARM-only. "
+            f"Current processor: {compat.inf_get_procname()}"
+        )
+    return reg
+
+
+def _thumb_state(ea: int, reg: int) -> dict:
+    """Describe the T value and containing range at an address."""
+    value = ida_segregs.get_sreg(ea, reg)
+    info = {
+        "addr": hex(ea),
+        "thumb": bool(value) if value != idaapi.BADSEL else None,
+        "value": None if value == idaapi.BADSEL else int(value),
+    }
+    rng = ida_segregs.sreg_range_t()
+    if ida_segregs.get_sreg_range(rng, ea, reg):
+        info["range_start"] = hex(rng.start_ea)
+        info["range_end"] = hex(rng.end_ea)
+        info["explicit"] = rng.tag == ida_segregs.SR_user
+    return info
+
+
+@tool
+@idaread
+def get_thumb(
+    addrs: Annotated[str, "Address(es) (0x8000, main) or list"],
+) -> list[dict]:
+    """Read ARM Thumb mode (the T segment register) at one or more addresses.
+
+    Returns thumb=true/false per address, plus the address range that value
+    covers and whether it was set explicitly or inherited.
+
+    ARM-only; other processors have no T register.
+    """
+    reg = _thumb_reg()
+    results = []
+    for item in normalize_list_input(addrs):
+        try:
+            results.append(_thumb_state(parse_address(item), reg))
+        except Exception as e:
+            results.append({"addr": str(item), "error": str(e)})
+    return results
+
+
+@tool
+@idasync
+def set_thumb(
+    start: Annotated[str, "Start address of the range"],
+    thumb: Annotated[bool, "True for Thumb, False for ARM"] = True,
+    end: Annotated[
+        str | None, "Optional end address; the previous mode resumes here"
+    ] = None,
+    redefine: Annotated[
+        bool, "Undefine any code in the range so it re-decodes in the new mode"
+    ] = True,
+) -> dict:
+    """Set ARM Thumb mode (the T segment register) over a range.
+
+    ORDER MATTERS. Set the mode BEFORE defining code: existing instructions are
+    not re-decoded when T changes, so they silently keep their old boundaries
+    while disassembling as something else entirely. By default this undefines
+    any code in the range so it decodes cleanly afterwards -- pass
+    redefine=False to leave existing items alone.
+
+    Typical raw Cortex-M firmware flow:
+        load_binary(..., processor="arm:ARMv7-M", file_type="binary", ...)
+        set_thumb(start="0x8000000", thumb=True)
+        define_func(...)
+
+    If `end` is omitted the mode applies from `start` to the end of the segment
+    (or until the next explicit range). Pass `end` to bound it, which restores
+    whatever mode was in effect there.
+
+    ARM-only; other processors have no T register.
+    """
+    reg = _thumb_reg()
+    start_ea = parse_address(start)
+    end_ea = parse_address(end) if end is not None else None
+
+    if end_ea is not None and end_ea <= start_ea:
+        raise IDAError(f"end ({hex(end_ea)}) must be above start ({hex(start_ea)})")
+
+    before = _thumb_state(start_ea, reg)
+    # Capture what follows the range so `end` can restore it rather than
+    # leaving the new mode running to the end of the segment.
+    tail_value = ida_segregs.get_sreg(end_ea, reg) if end_ea is not None else None
+
+    value = 1 if thumb else 0
+    undefined = 0
+    if redefine:
+        stop = end_ea if end_ea is not None else start_ea + 1
+        ea = start_ea
+        while ea < stop and ea != idaapi.BADADDR:
+            if ida_bytes.is_code(ida_bytes.get_flags(ea)):
+                size = ida_bytes.get_item_size(ea)
+                ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, size)
+                undefined += 1
+                ea += max(size, 1)
+            else:
+                ea = idaapi.next_head(ea, stop)
+
+    if not ida_segregs.split_sreg_range(
+        start_ea, reg, value, ida_segregs.SR_user, True
+    ):
+        raise IDAError(f"Failed to set T={value} at {hex(start_ea)}")
+
+    if end_ea is not None and tail_value != idaapi.BADSEL:
+        ida_segregs.split_sreg_range(
+            end_ea, reg, int(tail_value), ida_segregs.SR_user, True
+        )
+
+    result = {
+        "start": hex(start_ea),
+        "thumb": thumb,
+        "was_thumb": before.get("thumb"),
+        "ok": True,
+    }
+    if end_ea is not None:
+        result["end"] = hex(end_ea)
+        result["restored_after_end"] = (
+            None if tail_value == idaapi.BADSEL else bool(tail_value)
+        )
+    if undefined:
+        result["undefined_items"] = undefined
+    result["now"] = _thumb_state(start_ea, reg)
+    return result
+
+
+@tool
+@idasync
+def set_default_thumb(
+    addr: Annotated[str, "Any address inside the target segment"],
+    thumb: Annotated[bool, "True for Thumb, False for ARM"] = True,
+) -> dict:
+    """Set a segment's DEFAULT ARM/Thumb mode.
+
+    Use for a whole firmware image that is uniformly one mode -- the common
+    Cortex-M case -- instead of setting ranges piecemeal.
+
+    Note this is only the fallback: an explicit range created by set_thumb
+    takes precedence wherever one exists, so this does not override those.
+
+    ARM-only; other processors have no T register.
+    """
+    reg = _thumb_reg()
+    ea = parse_address(addr)
+    seg = idaapi.getseg(ea)
+    if seg is None:
+        raise IDAError(f"No segment at {hex(ea)}")
+
+    value = 1 if thumb else 0
+    setter = getattr(ida_segregs, "set_default_sreg_value_ea", None)
+    ok = (
+        setter(seg.start_ea, reg, value)
+        if setter is not None
+        else ida_segregs.set_default_sreg_value(seg, reg, value)
+    )
+    if not ok:
+        raise IDAError(f"Failed to set default T={value} for segment at {hex(ea)}")
+
+    return {
+        "segment_start": hex(seg.start_ea),
+        "segment_end": hex(seg.end_ea),
+        "default_thumb": thumb,
+        "ok": True,
+        "note": (
+            "This is the segment default; explicit ranges set by set_thumb still "
+            "take precedence where they exist."
+        ),
+        "effective_at_addr": _thumb_state(ea, reg),
+    }

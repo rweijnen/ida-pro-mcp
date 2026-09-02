@@ -5,6 +5,7 @@ import shutil
 import argparse
 import http.client
 import subprocess
+import time
 import tempfile
 import traceback
 import tomllib
@@ -39,8 +40,8 @@ dispatch_original = mcp.registry.dispatch
 class IDAInstance:
     """A discovered IDA Pro instance."""
 
-    __slots__ = ("host", "port", "binary_name", "binary_path", "base", "size",
-                 "processor", "bits", "analysis_complete")
+    __slots__ = ("host", "port", "binary_name", "binary_path", "input_path",
+                 "base", "size", "processor", "bits", "analysis_complete")
 
     def __init__(self, host: str, port: int, metadata: dict | None = None):
         self.host = host
@@ -48,6 +49,12 @@ class IDAInstance:
         md = metadata or {}
         self.binary_name: str = md.get("module", "")
         self.binary_path: str = md.get("path", "")
+        # The input file, as opposed to binary_path which is the .i64. Older
+        # plugin builds do not report it; fall back to stripping the database
+        # extension, which matches IDA's default APPEND_IDB_EXT=YES naming.
+        self.input_path: str = md.get("input_path", "") or os.path.splitext(
+            self.binary_path
+        )[0]
         self.base: str = md.get("base", "")
         self.size: str = md.get("size", "")
         self.processor: str = md.get("processor", "")
@@ -229,9 +236,49 @@ def get_active_instance() -> dict:
 # load_binary - spawn a new IDA instance
 # ============================================================================
 
+from ida_pro_mcp.binfmt import probe_binary as _probe_binary
+from ida_pro_mcp.devices import list_devices as _list_devices
+from ida_pro_mcp.loader_args import (
+    LoaderArgError,
+    build_loader_args,
+    existing_database as _existing_database,
+)
+from ida_pro_mcp.processors import PROCESSORS as _PROCESSOR_NAMES
+from ida_pro_mcp.processors import list_processors as _list_processors
+
 _IDA_MCP_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".ida_mcp")
 _IDA_MCP_CONFIG_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "config.json")
 _IDA_TOOLS_CACHE_FILE = os.path.join(_IDA_MCP_CONFIG_DIR, "tools_cache.json")
+
+
+def _wait_for_new_instance(
+    known_ports: set[int], timeout: float, proc: "subprocess.Popen | None" = None
+) -> "IDAInstance | None":
+    """Wait for a newly spawned IDA to publish its MCP port.
+
+    Returns the new instance, or None on timeout / if the process died first.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for inst in instance_manager.discover():
+            if inst.port not in known_ports:
+                return inst
+        # A spawn that dies (rejected loader args, locked database) will never
+        # publish a port; stop early rather than burning the whole timeout.
+        if proc is not None and proc.poll() is not None:
+            return None
+        time.sleep(2.0)
+    return None
+
+
+def _unused_idb_path(binary_path: str) -> str:
+    """Pick a database path for an additional instance of an already-open binary."""
+    stem = f"{binary_path}.mcp"
+    for n in range(2, 100):
+        candidate = f"{stem}{n}.i64"
+        if not os.path.exists(candidate):
+            return candidate
+    return f"{stem}{os.getpid()}.i64"
 
 
 def _read_ida_config() -> dict:
@@ -263,7 +310,92 @@ def _load_tools_cache() -> list:
 
 
 @mcp.tool
-def load_binary(binary_path: str) -> dict:
+def list_processors(family: str | None = None) -> dict:
+    """List IDA processor type names for use with load_binary(processor=...).
+
+    Only needed for headerless/raw binaries. For PE, ELF and Mach-O the loader
+    selects the processor itself -- call probe_binary first to check.
+
+    Note these are IDA's processor *names*, which differ from the module
+    filenames in IDA's procs/ directory (x86's module is 'pc', the name is
+    'metapc'). Names are case-sensitive: 'ColdFire' works, 'colfire' does not.
+
+    Args:
+        family: Optional family filter, e.g. "ARM", "MIPS", "TriCore".
+    """
+    entries = _list_processors(family)
+    if not entries:
+        known = sorted({e["family"] for e in _list_processors()})
+        return {"error": f"Unknown family {family!r}. Known: {', '.join(known)}"}
+    return {"processors": entries, "count": len(entries)}
+
+
+@mcp.tool
+def list_devices(processor: str) -> dict:
+    """List MCU device (chip variant) names for load_binary(device=...).
+
+    Many MCU processor modules cover a family whose members differ in memory
+    layout and peripheral registers. IDA normally asks which one via a dialog
+    at database creation -- but that dialog is invisible in autonomous mode, so
+    without an explicit device the module default is used silently. For TriCore
+    that default is tc1766, meaning a TC3xx image gets a TC1766 memory map.
+
+    Use the LEAF name from this list ("tc37x"), not the group path
+    ("tc3xx/tc37x"). An unknown device name is ignored by IDA SILENTLY and
+    produces a database with no memory map at all.
+
+    Args:
+        processor: IDA processor name, e.g. "tricore", "avr", "8051".
+    """
+    config = _read_ida_config()
+    ida_dir = config.get("ida_dir")
+    if not ida_dir:
+        return {
+            "error": (
+                "IDA installation path not found. Start IDA once with the MCP "
+                f"plugin so it can write the config to {_IDA_MCP_CONFIG_FILE}"
+            )
+        }
+    if processor.lower() not in _PROCESSOR_NAMES:
+        return {
+            "error": f"Unknown processor {processor!r}. Use list_processors to see "
+                     f"valid names."
+        }
+    return _list_devices(ida_dir, processor)
+
+
+@mcp.tool
+def probe_binary(binary_path: str) -> dict:
+    """Detect a binary's format before loading it, to decide on loader options.
+
+    Call this before load_binary when you are unsure what a file is. It runs in
+    the MCP server itself, so it works with no IDA instance running.
+
+    Returns the detected format and, for recognized formats, the processor IDA
+    will select -- along with explicit advice on whether to pass loader options.
+
+    Args:
+        binary_path: Absolute path to the file to inspect.
+    """
+    if not os.path.isabs(binary_path):
+        return {"error": f"binary_path must be absolute, got: {binary_path}"}
+    return _probe_binary(binary_path)
+
+
+@mcp.tool
+def load_binary(
+    binary_path: str,
+    processor: str | None = None,
+    file_type: str | None = None,
+    load_base: int | None = None,
+    entry_point: int | None = None,
+    device: str | None = None,
+    idb_path: str | None = None,
+    new_instance: bool = False,
+    fresh_db: bool = False,
+    wait: bool = True,
+    wait_timeout: float = 180.0,
+) -> dict:
     """Open a binary in a new IDA Pro instance. The MCP plugin auto-starts.
 
     Spawns IDA Pro with the given binary and returns immediately.
@@ -271,8 +403,58 @@ def load_binary(binary_path: str) -> dict:
     and the MCP plugin starts (typically 10-60s, longer for large binaries).
     Poll list_instances in a background task to detect when it's ready.
 
+    IDA runs in autonomous mode (-A): no dialogs are shown and the default
+    answer is taken for each.
+
+    For recognized formats (PE/ELF/Mach-O) pass ONLY binary_path -- the loader
+    selects the processor and base correctly, and overriding them is more
+    likely to corrupt the load than improve it.
+
+    For a raw/headerless blob the defaults (binary loader, metapc, base 0) are
+    almost certainly wrong and fail SILENTLY -- you get a confidently wrong
+    database rather than an error. Call probe_binary first; if it reports the
+    file is unrecognized, pass file_type="binary" plus the correct processor
+    and load_base.
+
+    AFTER LOADING AN MCU TARGET, CHECK THE RESULT YOURSELF. IDA does not record
+    which device it used, and ignores an unrecognized device without any error.
+    Read the ida://idb/segments resource once the instance is up and confirm the
+    memory map matches the chip you expect: the right device produces many named
+    peripheral/memory segments, while an ignored one leaves only the segment for
+    the file itself. If the map looks wrong, reload with a corrected device.
+
     Args:
         binary_path: Absolute path to the binary file to analyze.
+        processor: IDA processor name, e.g. "tricore", "mipsb", or with ARM
+            options "arm:ARMv7-A;NEON". See list_processors. Only the ARM
+            module accepts an option suffix.
+        file_type: Loader/format prefix, e.g. "binary" for a headerless blob.
+        load_base: Byte address to load at. Must be 16-byte aligned.
+        entry_point: Initial entry point address.
+        device: MCU device / chip variant, e.g. "tc37x". Required for correct
+            memory layout and peripheral names on MCU targets -- without it
+            IDA silently uses the module default (tc1766 for TriCore). Use
+            list_devices to find valid names. The name is checked against the
+            processor's config before spawning, but see the note below: after
+            loading, confirm the segment map yourself.
+        idb_path: Write the database here instead of alongside the input file.
+            Implies new_instance.
+        new_instance: Open a second copy of a binary that is already open in
+            another instance, using a separate database file. Without this,
+            loading an already-open binary is refused -- IDA locks the database
+            it has open, so the spawned process would die silently. Useful for
+            comparing two loads of the same image with different settings, e.g.
+            two candidate MCU devices side by side.
+        fresh_db: Discard any existing .i64 and re-analyze from scratch.
+            By default an existing database is reused (and opened without
+            prompting).
+        wait: Wait for the new instance to come up and make it active, so no
+            polling of list_instances is needed. This waits only for IDA to
+            start (seconds to a minute), NOT for auto-analysis, which can take
+            far longer -- check analysis_status for that.
+        wait_timeout: Give up waiting for the instance after this long. The
+            spawn is not cancelled; list_instances will show it if it appears
+            later.
     """
     # Validate path
     if not os.path.isabs(binary_path):
@@ -308,18 +490,163 @@ def load_binary(binary_path: str) -> dict:
     # Record existing ports before spawning
     pre_spawn = [inst.port for inst in instance_manager.discover()]
 
-    # Spawn IDA
+    # Refuse to open a binary another instance already holds. IDA locks the
+    # database it has open, so -c cannot delete it and the spawned process dies
+    # without ever publishing a port -- the caller just sees a timeout.
+    if idb_path is not None:
+        new_instance = True
+    if not new_instance:
+        target = os.path.normcase(os.path.abspath(binary_path))
+        for inst in instance_manager.discover():
+            existing = inst.input_path
+            if existing and os.path.normcase(os.path.abspath(existing)) == target:
+                return {
+                    "error": (
+                        f"{os.path.basename(binary_path)} is already open in the "
+                        f"instance on port {inst.port}. Use switch_instance("
+                        f"{inst.port}) to work with it. To open a second copy with "
+                        f"different loader settings, pass new_instance=True (each "
+                        f"instance needs its own database file)."
+                    ),
+                    "existing_port": inst.port,
+                }
+
+    if new_instance and idb_path is None:
+        idb_path = _unused_idb_path(binary_path)
+
+    # Loader options only apply when a database is created. If one already
+    # exists, IDA exits immediately (rc=1) rather than reporting a conflict, so
+    # catch it here -- silently ignoring the options would be worse.
+    wants_loader_opts = any(
+        v is not None for v in (processor, file_type, load_base, entry_point, device)
+    )
+    if wants_loader_opts and not fresh_db and idb_path is None:
+        existing = _existing_database(binary_path)
+        if existing:
+            return {
+                "error": (
+                    f"Loader options were given, but a database already exists "
+                    f"({os.path.basename(existing)}). IDA applies these only when "
+                    f"creating a database and refuses to start otherwise. Pass "
+                    f"fresh_db=True to discard it and re-analyze, or drop the loader "
+                    f"options to open the existing database as-is."
+                ),
+                "existing_database": existing,
+            }
+
+    # Validate the device against the processor's config before spawning. IDA
+    # ignores an unknown device SILENTLY, producing a database with no memory
+    # map -- so an unchecked typo here is invisible rather than an error.
+    if device is not None and device.upper() != "NONE":
+        if processor is None:
+            return {
+                "error": "device requires processor to be specified as well, since "
+                         "device names are per-processor."
+            }
+        base_proc = processor.split(":", 1)[0]
+        known = _list_devices(ida_dir, base_proc)
+        if known.get("devices") and device not in known["devices"]:
+            leaf = device.rsplit("/", 1)[-1]
+            if "/" in device and leaf in known["devices"]:
+                return {
+                    "error": f"device {device!r} is a group path. IDA matches the leaf "
+                             f"name only -- use {leaf!r}."
+                }
+            close = [d for d in known["devices"] if d.lower() == device.lower()]
+            hint = (
+                f" Did you mean {close[0]!r}? Device names are case-sensitive."
+                if close
+                else f" Valid devices: {', '.join(known['devices'][:40])}"
+            )
+            return {
+                "error": f"Unknown device {device!r} for processor {base_proc!r}.{hint}"
+            }
+
+    # Build loader args: an invalid -p option string is FATAL in IDA, so validating
+    # here is what stops a bad value from taking the new instance down.
     try:
-        proc = subprocess.Popen([ida_exe, binary_path])
+        loader_args = build_loader_args(
+            processor=processor,
+            file_type=file_type,
+            load_base=load_base,
+            entry_point=entry_point,
+            device=device,
+            idb_path=idb_path,
+            fresh_db=fresh_db,
+        )
+    except LoaderArgError as e:
+        return {"error": str(e)}
+
+    # Spawn IDA. -A is autonomous mode: no dialogs, default answer to each.
+    # Without it the "Load a new file" dialog blocks the load indefinitely,
+    # since an agent can neither see nor dismiss it.
+    #
+    # Note argv is passed as a list, never through a shell: ARM option strings
+    # contain ';', which PowerShell would treat as a statement separator.
+    argv = [ida_exe, "-A", *loader_args, binary_path]
+
+    try:
+        proc = subprocess.Popen(argv)
     except Exception as e:
         return {"error": f"Failed to launch IDA: {e}"}
 
-    return {
+    result = {
         "status": "spawned",
         "pid": proc.pid,
         "binary_path": binary_path,
+        "loader_args": loader_args,
         "pre_existing_ports": pre_spawn,
     }
+
+    # Wait for the instance to publish its port, then make it active. This is
+    # the window where IDA is starting up and the plugin has not yet bound a
+    # port, so the instance is invisible to list_instances -- bounded and short
+    # (typically 10-60s), unlike auto-analysis, which is not waited for here.
+    if wait:
+        appeared = _wait_for_new_instance(set(pre_spawn), wait_timeout, proc)
+        if appeared is None:
+            exit_code = proc.poll()
+            if exit_code is not None:
+                result["status"] = "failed"
+                result["exit_code"] = exit_code
+                result["error"] = (
+                    f"IDA exited with code {exit_code} before publishing a port, so "
+                    f"the load failed. Usual causes: loader options rejected (an "
+                    f"invalid processor option is fatal), or a database that is "
+                    f"locked or already exists. Loader args were: "
+                    f"{' '.join(loader_args) or '(none)'}"
+                )
+            else:
+                result["status"] = "timeout"
+                result["error"] = (
+                    f"No instance appeared within {wait_timeout:g}s, but IDA is still "
+                    f"running -- it may be loading a large binary. The spawn was not "
+                    f"cancelled; call list_instances to check for it."
+                )
+            return result
+        instance_manager.active_port = appeared.port
+        result["status"] = "ready"
+        result["port"] = appeared.port
+        result["processor"] = appeared.processor
+        result["bits"] = appeared.bits
+        result["analysis_complete"] = appeared.analysis_complete
+        result["active"] = True
+        if not appeared.analysis_complete:
+            result["next"] = (
+                "Auto-analysis is still running, so results are incomplete. Use "
+                "wait_for_analysis for a short binary, or get on with other work and "
+                "check analysis_status -- do not sit in a polling loop."
+            )
+    if idb_path is not None:
+        result["idb_path"] = idb_path
+    if device is not None:
+        result["verify"] = (
+            f"IDA does not record which device it used, so device={device!r} cannot be "
+            f"confirmed programmatically. Once the instance is up, read "
+            f"ida://idb/segments and check the memory map matches the expected chip. "
+            f"Only the file's own segment means the device was ignored."
+        )
+    return result
 
 
 # ============================================================================
@@ -357,7 +684,15 @@ TOKEN EFFICIENCY:
 """
 
 # Tools handled locally by the MCP server (not forwarded to IDA plugin)
-_LOCAL_TOOLS = {"list_instances", "switch_instance", "get_active_instance", "load_binary"}
+_LOCAL_TOOLS = {
+    "list_instances",
+    "switch_instance",
+    "get_active_instance",
+    "load_binary",
+    "list_processors",
+    "list_devices",
+    "probe_binary",
+}
 
 
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
@@ -1500,7 +1835,7 @@ def list_available_clients():
         "  ida-pro-mcp --install vscode --scope project              # Project-level config"
     )
     print(
-        "  ida-pro-mcp --install cursor --transport streamable-http  # Streamable HTTP config"
+        "  ida-pro-mcp --install cursor --transport streamable-http  # Direct HTTP (no proxy tools)"
     )
     print(
         "  ida-pro-mcp --uninstall cursor                            # Uninstall specific target"
@@ -1802,23 +2137,11 @@ def _interactive_install(*, uninstall: bool, args):
     """Full interactive install/uninstall flow with transport and scope selection."""
     action = "uninstall" if uninstall else "install"
 
-    # Step 1: Transport selection (skip for uninstall, or if --transport was explicitly set)
-    if not uninstall and args.transport is None:
-        choice = interactive_choose(
-            ["Streamable HTTP (recommended)", "stdio", "SSE"],
-            "Select transport mode:",
-        )
-        if choice is None:
-            print("Cancelled.")
-            return
-        if choice.startswith("stdio"):
-            transport = "stdio"
-        elif choice.startswith("Streamable"):
-            transport = "streamable-http"
-        else:
-            transport = "sse"
-    elif not uninstall:
-        transport = _resolve_transport(args.transport or "streamable-http")
+    # Step 1: Transport selection
+    # Always default to stdio so the MCP proxy layer is active (required for load_binary,
+    # list_instances, etc.). Power users can override with --transport.
+    if not uninstall:
+        transport = _resolve_transport(args.transport or "stdio")
     else:
         transport = "stdio"  # doesn't matter for uninstall
 
@@ -1926,7 +2249,8 @@ def main():
         "--transport",
         type=str,
         default=None,
-        help="MCP transport for install: 'streamable-http' (default), 'stdio', or 'sse'. "
+        help="MCP transport for install: 'stdio' (default), 'streamable-http', or 'sse'. "
+        "stdio is required for proxy tools (load_binary, list_instances, etc.). "
         "For running: use stdio (default) or pass a URL (e.g., http://127.0.0.1:8744[/mcp|/sse])",
     )
     parser.add_argument(
@@ -1987,7 +2311,7 @@ def main():
         if targets_str:
             # Explicit targets: --install claude,cursor,ida-plugin
             # Use CLI flags for transport/scope (no interactive prompts)
-            transport = _resolve_transport(args.transport or "streamable-http")
+            transport = _resolve_transport(args.transport or "stdio")
             scope = args.scope or "project"
 
             targets = [t.strip() for t in targets_str.split(",") if t.strip()]
