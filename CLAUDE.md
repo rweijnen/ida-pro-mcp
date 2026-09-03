@@ -98,6 +98,36 @@ def my_api(addrs: Annotated[str, "Addresses (0x401000, main) or list"]) -> list[
 - Parse addresses with `parse_address()`
 - Normalize batch input with `normalize_list_input()` / `normalize_dict_list()`
 - Use shared pagination / filtering helpers from `utils.py`
+- TypedDict response types live in `utils.py`
+
+### Decorator reference
+```python
+from .rpc import tool, unsafe, ext
+from .sync import idaread, idasync, tool_timeout
+
+@ext("dbg")        # extension group; hidden unless requested with ?ext=dbg
+@unsafe            # dangerous tool; excluded unless the server runs with --unsafe
+@tool              # registers the tool
+@idasync           # lock mode (@idaread / @idasync)
+@tool_timeout(90.0)  # optional per-tool timeout, seconds
+def dbg_start():     # default 60, overridable via IDA_MCP_TOOL_TIMEOUT_SEC
+    ...
+```
+Order matters. The markers (`@ext`, `@unsafe`) go *above* `@tool` because they tag the
+registered name; the lock and `@tool_timeout` go *below* it because they wrap the call.
+
+### Output size limiting
+Handled centrally in `rpc.py`, so individual tools never deal with it. Results whose
+compact JSON exceeds `OUTPUT_LIMIT_MAX_CHARS` (50000) are cached under a UUID
+(`OUTPUT_CACHE_MAX_SIZE` = 100, FIFO eviction) and replaced by a preview: strings clipped
+to 1000 chars, lists to 10 items, recursing 5 levels deep. The preview carries
+`_output_truncated`, `_total_chars`, `_output_id` and a `_download_url` pointing at
+`/output/<id>.json` on the IDA instance.
+
+Every result is serialized **twice** on the wire — `zeromcp` puts it in both
+`content[0].text` and `structuredContent` (spec-mandated: tools declare `outputSchema`,
+so `structuredContent` is required, and a text block is required for compatibility).
+Truncation must therefore rewrite *both*, or the cap silently does nothing.
 
 ### Unsafe operations
 Debugger or destructive operations should be marked unsafe:
