@@ -116,7 +116,7 @@ def _install_tools_call_patch() -> None:
         if structured is None:
             return response
 
-        serialized = json.dumps(structured)
+        serialized = json.dumps(structured, separators=(",", ":"))
         if len(serialized) <= OUTPUT_LIMIT_MAX_CHARS:
             return response
 
@@ -126,9 +126,18 @@ def _install_tools_call_patch() -> None:
         preview = _truncate_value(structured)
         preview = _add_download_info(preview, output_id, len(serialized))
 
+        # The content block must carry the *preview*, not the original result.
+        # zeromcp duplicates every result into content[0].text, so returning the
+        # untouched content here would ship the full untruncated payload and make
+        # the size limit a no-op for any client that reads content.
         return {
             "structuredContent": preview,
-            "content": response.get("content", []),
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(preview, separators=(",", ":")),
+                }
+            ],
             "isError": False,
         }
 
